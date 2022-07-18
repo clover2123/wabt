@@ -1080,22 +1080,6 @@ RunResult Thread::Run(Trap::Ptr* out_trap) {
   return result;
 }
 
-RunResult Thread::Run(int num_instructions, Trap::Ptr* out_trap) {
-  DefinedFunc::Ptr func{store_, frames_.back().func};
-  for (; num_instructions > 0; --num_instructions) {
-    auto result = StepInternal(out_trap);
-    if (result != RunResult::Ok) {
-      return result;
-    }
-  }
-  return RunResult::Ok;
-}
-
-RunResult Thread::Step(Trap::Ptr* out_trap) {
-  DefinedFunc::Ptr func{store_, frames_.back().func};
-  return StepInternal(out_trap);
-}
-
 Value& Thread::Pick(Index index) {
   assert(index > 0 && index <= values_.size());
   return values_[values_.size() - index];
@@ -1138,775 +1122,1263 @@ void Thread::Push(Ref ref) {
   values_.push_back(Value::Make(ref));
 }
 
-RunResult Thread::StepInternal(Trap::Ptr* out_trap) {
+#define RETURN_IF(code)                        \
+  {                                            \
+    RunResult res = code;                      \
+    if (WABT_UNLIKELY(res != RunResult::Ok)) { \
+      return res;                              \
+    }                                          \
+    break;                                     \
+  }
+
+RunResult Thread::Run(int num_instructions, Trap::Ptr* out_trap) {
   using O = Opcode;
 
-  u32& pc = frames_.back().offset;
-  auto& istream = mod_->desc().istream;
+  DefinedFunc::Ptr func{store_, frames_.back().func};
+  for (; num_instructions > 0; --num_instructions) {
+    u32& pc = frames_.back().offset;
+    auto& istream = mod_->desc().istream;
 
-  if (trace_stream_) {
-    istream.Trace(trace_stream_, pc, trace_source_.get());
-  }
+    if (trace_stream_) {
+      istream.Trace(trace_stream_, pc, trace_source_.get());
+    }
 
-  auto instr = istream.Read(&pc);
-  switch (instr.op) {
-    case O::Unreachable:
-      return TRAP("unreachable executed");
+    auto instr = istream.Read(&pc);
+    switch (instr.op) {
+      case O::Unreachable:
+        return TRAP("unreachable executed");
 
-    case O::Br:
-      pc = instr.imm_u32;
-      break;
-
-    case O::BrIf:
-      if (Pop<u32>()) {
+      case O::Br:
         pc = instr.imm_u32;
-      }
-      break;
+        break;
 
-    case O::BrTable: {
-      auto key = Pop<u32>();
-      if (key >= instr.imm_u32) {
-        key = instr.imm_u32;
-      }
-      pc += key * Istream::kBrTableEntrySize;
-      break;
-    }
-
-    case O::Return:
-      return PopCall();
-
-    case O::Call: {
-      Ref new_func_ref = inst_->funcs()[instr.imm_u32];
-      DefinedFunc::Ptr new_func{store_, new_func_ref};
-      if (PushCall(new_func_ref, new_func->desc().code_offset, out_trap) ==
-          RunResult::Trap) {
-        return RunResult::Trap;
-      }
-      break;
-    }
-
-    case O::CallIndirect:
-    case O::ReturnCallIndirect: {
-      Table::Ptr table{store_, inst_->tables()[instr.imm_u32x2.fst]};
-      auto&& func_type = mod_->desc().func_types[instr.imm_u32x2.snd];
-      auto entry = Pop<u32>();
-      TRAP_IF(entry >= table->elements().size(), "undefined table index");
-      auto new_func_ref = table->elements()[entry];
-      TRAP_IF(new_func_ref == Ref::Null, "uninitialized table element");
-      Func::Ptr new_func{store_, new_func_ref};
-      TRAP_IF(
-          Failed(Match(new_func->type(), func_type, nullptr)),
-          "indirect call signature mismatch");  // TODO: don't use "signature"
-      if (instr.op == O::ReturnCallIndirect) {
-        return DoReturnCall(new_func, out_trap);
-      } else {
-        return DoCall(new_func, out_trap);
-      }
-    }
-
-    case O::Drop:
-      Pop();
-      break;
-
-    case O::Select: {
-      // TODO: need to mark whether this is a ref.
-      auto cond = Pop<u32>();
-      Value false_ = Pop();
-      Value true_ = Pop();
-      Push(cond ? true_ : false_);
-      break;
-    }
-
-    case O::LocalGet:
-      // TODO: need to mark whether this is a ref.
-      Push(Pick(instr.imm_u32));
-      break;
-
-    case O::LocalSet: {
-      Pick(instr.imm_u32) = Pick(1);
-      Pop();
-      break;
-    }
-
-    case O::LocalTee:
-      Pick(instr.imm_u32) = Pick(1);
-      break;
-
-    case O::GlobalGet: {
-      // TODO: need to mark whether this is a ref.
-      Global::Ptr global{store_, inst_->globals()[instr.imm_u32]};
-      Push(global->Get());
-      break;
-    }
-
-    case O::GlobalSet: {
-      Global::Ptr global{store_, inst_->globals()[instr.imm_u32]};
-      global->UnsafeSet(Pop());
-      break;
-    }
-
-    case O::I32Load:    return DoLoad<u32>(instr, out_trap);
-    case O::I64Load:    return DoLoad<u64>(instr, out_trap);
-    case O::F32Load:    return DoLoad<f32>(instr, out_trap);
-    case O::F64Load:    return DoLoad<f64>(instr, out_trap);
-    case O::I32Load8S:  return DoLoad<s32, s8>(instr, out_trap);
-    case O::I32Load8U:  return DoLoad<u32, u8>(instr, out_trap);
-    case O::I32Load16S: return DoLoad<s32, s16>(instr, out_trap);
-    case O::I32Load16U: return DoLoad<u32, u16>(instr, out_trap);
-    case O::I64Load8S:  return DoLoad<s64, s8>(instr, out_trap);
-    case O::I64Load8U:  return DoLoad<u64, u8>(instr, out_trap);
-    case O::I64Load16S: return DoLoad<s64, s16>(instr, out_trap);
-    case O::I64Load16U: return DoLoad<u64, u16>(instr, out_trap);
-    case O::I64Load32S: return DoLoad<s64, s32>(instr, out_trap);
-    case O::I64Load32U: return DoLoad<u64, u32>(instr, out_trap);
-
-    case O::I32Store:   return DoStore<u32>(instr, out_trap);
-    case O::I64Store:   return DoStore<u64>(instr, out_trap);
-    case O::F32Store:   return DoStore<f32>(instr, out_trap);
-    case O::F64Store:   return DoStore<f64>(instr, out_trap);
-    case O::I32Store8:  return DoStore<u32, u8>(instr, out_trap);
-    case O::I32Store16: return DoStore<u32, u16>(instr, out_trap);
-    case O::I64Store8:  return DoStore<u64, u8>(instr, out_trap);
-    case O::I64Store16: return DoStore<u64, u16>(instr, out_trap);
-    case O::I64Store32: return DoStore<u64, u32>(instr, out_trap);
-
-    case O::MemorySize: {
-      Memory::Ptr memory{store_, inst_->memories()[instr.imm_u32]};
-      if (memory->type().limits.is_64) {
-        Push<u64>(memory->PageSize());
-      } else {
-        Push<u32>(static_cast<u32>(memory->PageSize()));
-      }
-      break;
-    }
-
-    case O::MemoryGrow: {
-      Memory::Ptr memory{store_, inst_->memories()[instr.imm_u32]};
-      u64 old_size = memory->PageSize();
-      if (memory->type().limits.is_64) {
-        if (Failed(memory->Grow(Pop<u64>()))) {
-          Push<s64>(-1);
-        } else {
-          Push<u64>(old_size);
+      case O::BrIf:
+        if (Pop<u32>()) {
+          pc = instr.imm_u32;
         }
-      } else {
-        if (Failed(memory->Grow(Pop<u32>()))) {
-          Push<s32>(-1);
+        break;
+
+      case O::BrTable: {
+        auto key = Pop<u32>();
+        if (key >= instr.imm_u32) {
+          key = instr.imm_u32;
+        }
+        pc += key * Istream::kBrTableEntrySize;
+        break;
+      }
+
+      case O::Return:
+        RETURN_IF((PopCall()));
+
+      case O::Call: {
+        Ref new_func_ref = inst_->funcs()[instr.imm_u32];
+        DefinedFunc::Ptr new_func{store_, new_func_ref};
+        if (PushCall(new_func_ref, new_func->desc().code_offset, out_trap) ==
+            RunResult::Trap) {
+          return RunResult::Trap;
+        }
+        break;
+      }
+
+      case O::CallIndirect:
+      case O::ReturnCallIndirect: {
+        Table::Ptr table{store_, inst_->tables()[instr.imm_u32x2.fst]};
+        auto&& func_type = mod_->desc().func_types[instr.imm_u32x2.snd];
+        auto entry = Pop<u32>();
+        TRAP_IF(entry >= table->elements().size(), "undefined table index");
+        auto new_func_ref = table->elements()[entry];
+        TRAP_IF(new_func_ref == Ref::Null, "uninitialized table element");
+        Func::Ptr new_func{store_, new_func_ref};
+        TRAP_IF(
+            Failed(Match(new_func->type(), func_type, nullptr)),
+            "indirect call signature mismatch");  // TODO: don't use "signature"
+        if (instr.op == O::ReturnCallIndirect) {
+          RETURN_IF((DoReturnCall(new_func, out_trap)));
         } else {
-          Push<u32>(old_size);
+          RETURN_IF((DoCall(new_func, out_trap)));
         }
       }
-      break;
-    }
 
-    case O::I32Const: Push(instr.imm_u32); break;
-    case O::F32Const: Push(instr.imm_f32); break;
-    case O::I64Const: Push(instr.imm_u64); break;
-    case O::F64Const: Push(instr.imm_f64); break;
+      case O::Drop:
+        Pop();
+        break;
 
-    case O::I32Eqz: return DoUnop(IntEqz<u32>);
-    case O::I32Eq:  return DoBinop(Eq<u32>);
-    case O::I32Ne:  return DoBinop(Ne<u32>);
-    case O::I32LtS: return DoBinop(Lt<s32>);
-    case O::I32LtU: return DoBinop(Lt<u32>);
-    case O::I32GtS: return DoBinop(Gt<s32>);
-    case O::I32GtU: return DoBinop(Gt<u32>);
-    case O::I32LeS: return DoBinop(Le<s32>);
-    case O::I32LeU: return DoBinop(Le<u32>);
-    case O::I32GeS: return DoBinop(Ge<s32>);
-    case O::I32GeU: return DoBinop(Ge<u32>);
-
-    case O::I64Eqz: return DoUnop(IntEqz<u64>);
-    case O::I64Eq:  return DoBinop(Eq<u64>);
-    case O::I64Ne:  return DoBinop(Ne<u64>);
-    case O::I64LtS: return DoBinop(Lt<s64>);
-    case O::I64LtU: return DoBinop(Lt<u64>);
-    case O::I64GtS: return DoBinop(Gt<s64>);
-    case O::I64GtU: return DoBinop(Gt<u64>);
-    case O::I64LeS: return DoBinop(Le<s64>);
-    case O::I64LeU: return DoBinop(Le<u64>);
-    case O::I64GeS: return DoBinop(Ge<s64>);
-    case O::I64GeU: return DoBinop(Ge<u64>);
-
-    case O::F32Eq:  return DoBinop(Eq<f32>);
-    case O::F32Ne:  return DoBinop(Ne<f32>);
-    case O::F32Lt:  return DoBinop(Lt<f32>);
-    case O::F32Gt:  return DoBinop(Gt<f32>);
-    case O::F32Le:  return DoBinop(Le<f32>);
-    case O::F32Ge:  return DoBinop(Ge<f32>);
-
-    case O::F64Eq:  return DoBinop(Eq<f64>);
-    case O::F64Ne:  return DoBinop(Ne<f64>);
-    case O::F64Lt:  return DoBinop(Lt<f64>);
-    case O::F64Gt:  return DoBinop(Gt<f64>);
-    case O::F64Le:  return DoBinop(Le<f64>);
-    case O::F64Ge:  return DoBinop(Ge<f64>);
-
-    case O::I32Clz:    return DoUnop(IntClz<u32>);
-    case O::I32Ctz:    return DoUnop(IntCtz<u32>);
-    case O::I32Popcnt: return DoUnop(IntPopcnt<u32>);
-    case O::I32Add:    return DoBinop(Add<u32>);
-    case O::I32Sub:    return DoBinop(Sub<u32>);
-    case O::I32Mul:    return DoBinop(Mul<u32>);
-    case O::I32DivS:   return DoBinop(IntDiv<s32>, out_trap);
-    case O::I32DivU:   return DoBinop(IntDiv<u32>, out_trap);
-    case O::I32RemS:   return DoBinop(IntRem<s32>, out_trap);
-    case O::I32RemU:   return DoBinop(IntRem<u32>, out_trap);
-    case O::I32And:    return DoBinop(IntAnd<u32>);
-    case O::I32Or:     return DoBinop(IntOr<u32>);
-    case O::I32Xor:    return DoBinop(IntXor<u32>);
-    case O::I32Shl:    return DoBinop(IntShl<u32>);
-    case O::I32ShrS:   return DoBinop(IntShr<s32>);
-    case O::I32ShrU:   return DoBinop(IntShr<u32>);
-    case O::I32Rotl:   return DoBinop(IntRotl<u32>);
-    case O::I32Rotr:   return DoBinop(IntRotr<u32>);
-
-    case O::I64Clz:    return DoUnop(IntClz<u64>);
-    case O::I64Ctz:    return DoUnop(IntCtz<u64>);
-    case O::I64Popcnt: return DoUnop(IntPopcnt<u64>);
-    case O::I64Add:    return DoBinop(Add<u64>);
-    case O::I64Sub:    return DoBinop(Sub<u64>);
-    case O::I64Mul:    return DoBinop(Mul<u64>);
-    case O::I64DivS:   return DoBinop(IntDiv<s64>, out_trap);
-    case O::I64DivU:   return DoBinop(IntDiv<u64>, out_trap);
-    case O::I64RemS:   return DoBinop(IntRem<s64>, out_trap);
-    case O::I64RemU:   return DoBinop(IntRem<u64>, out_trap);
-    case O::I64And:    return DoBinop(IntAnd<u64>);
-    case O::I64Or:     return DoBinop(IntOr<u64>);
-    case O::I64Xor:    return DoBinop(IntXor<u64>);
-    case O::I64Shl:    return DoBinop(IntShl<u64>);
-    case O::I64ShrS:   return DoBinop(IntShr<s64>);
-    case O::I64ShrU:   return DoBinop(IntShr<u64>);
-    case O::I64Rotl:   return DoBinop(IntRotl<u64>);
-    case O::I64Rotr:   return DoBinop(IntRotr<u64>);
-
-    case O::F32Abs:     return DoUnop(FloatAbs<f32>);
-    case O::F32Neg:     return DoUnop(FloatNeg<f32>);
-    case O::F32Ceil:    return DoUnop(FloatCeil<f32>);
-    case O::F32Floor:   return DoUnop(FloatFloor<f32>);
-    case O::F32Trunc:   return DoUnop(FloatTrunc<f32>);
-    case O::F32Nearest: return DoUnop(FloatNearest<f32>);
-    case O::F32Sqrt:    return DoUnop(FloatSqrt<f32>);
-    case O::F32Add:      return DoBinop(Add<f32>);
-    case O::F32Sub:      return DoBinop(Sub<f32>);
-    case O::F32Mul:      return DoBinop(Mul<f32>);
-    case O::F32Div:      return DoBinop(FloatDiv<f32>);
-    case O::F32Min:      return DoBinop(FloatMin<f32>);
-    case O::F32Max:      return DoBinop(FloatMax<f32>);
-    case O::F32Copysign: return DoBinop(FloatCopysign<f32>);
-
-    case O::F64Abs:     return DoUnop(FloatAbs<f64>);
-    case O::F64Neg:     return DoUnop(FloatNeg<f64>);
-    case O::F64Ceil:    return DoUnop(FloatCeil<f64>);
-    case O::F64Floor:   return DoUnop(FloatFloor<f64>);
-    case O::F64Trunc:   return DoUnop(FloatTrunc<f64>);
-    case O::F64Nearest: return DoUnop(FloatNearest<f64>);
-    case O::F64Sqrt:    return DoUnop(FloatSqrt<f64>);
-    case O::F64Add:      return DoBinop(Add<f64>);
-    case O::F64Sub:      return DoBinop(Sub<f64>);
-    case O::F64Mul:      return DoBinop(Mul<f64>);
-    case O::F64Div:      return DoBinop(FloatDiv<f64>);
-    case O::F64Min:      return DoBinop(FloatMin<f64>);
-    case O::F64Max:      return DoBinop(FloatMax<f64>);
-    case O::F64Copysign: return DoBinop(FloatCopysign<f64>);
-
-    case O::I32WrapI64:      return DoConvert<u32, u64>(out_trap);
-    case O::I32TruncF32S:    return DoConvert<s32, f32>(out_trap);
-    case O::I32TruncF32U:    return DoConvert<u32, f32>(out_trap);
-    case O::I32TruncF64S:    return DoConvert<s32, f64>(out_trap);
-    case O::I32TruncF64U:    return DoConvert<u32, f64>(out_trap);
-    case O::I64ExtendI32S:   return DoConvert<s64, s32>(out_trap);
-    case O::I64ExtendI32U:   return DoConvert<u64, u32>(out_trap);
-    case O::I64TruncF32S:    return DoConvert<s64, f32>(out_trap);
-    case O::I64TruncF32U:    return DoConvert<u64, f32>(out_trap);
-    case O::I64TruncF64S:    return DoConvert<s64, f64>(out_trap);
-    case O::I64TruncF64U:    return DoConvert<u64, f64>(out_trap);
-    case O::F32ConvertI32S:  return DoConvert<f32, s32>(out_trap);
-    case O::F32ConvertI32U:  return DoConvert<f32, u32>(out_trap);
-    case O::F32ConvertI64S:  return DoConvert<f32, s64>(out_trap);
-    case O::F32ConvertI64U:  return DoConvert<f32, u64>(out_trap);
-    case O::F32DemoteF64:    return DoConvert<f32, f64>(out_trap);
-    case O::F64ConvertI32S:  return DoConvert<f64, s32>(out_trap);
-    case O::F64ConvertI32U:  return DoConvert<f64, u32>(out_trap);
-    case O::F64ConvertI64S:  return DoConvert<f64, s64>(out_trap);
-    case O::F64ConvertI64U:  return DoConvert<f64, u64>(out_trap);
-    case O::F64PromoteF32:   return DoConvert<f64, f32>(out_trap);
-
-    case O::I32ReinterpretF32: return DoReinterpret<u32, f32>();
-    case O::F32ReinterpretI32: return DoReinterpret<f32, u32>();
-    case O::I64ReinterpretF64: return DoReinterpret<u64, f64>();
-    case O::F64ReinterpretI64: return DoReinterpret<f64, u64>();
-
-    case O::I32Extend8S:   return DoUnop(IntExtend<u32, 7>);
-    case O::I32Extend16S:  return DoUnop(IntExtend<u32, 15>);
-    case O::I64Extend8S:   return DoUnop(IntExtend<u64, 7>);
-    case O::I64Extend16S:  return DoUnop(IntExtend<u64, 15>);
-    case O::I64Extend32S:  return DoUnop(IntExtend<u64, 31>);
-
-    case O::InterpAlloca:
-      values_.resize(values_.size() + instr.imm_u32);
-      // refs_ doesn't need to be updated; We may be allocating space for
-      // references, but they will be initialized to null, so it is OK if we
-      // don't mark them.
-      break;
-
-    case O::InterpBrUnless:
-      if (!Pop<u32>()) {
-        pc = instr.imm_u32;
+      case O::Select: {
+        // TODO: need to mark whether this is a ref.
+        auto cond = Pop<u32>();
+        Value false_ = Pop();
+        Value true_ = Pop();
+        Push(cond ? true_ : false_);
+        break;
       }
-      break;
 
-    case O::InterpCallImport: {
-      Ref new_func_ref = inst_->funcs()[instr.imm_u32];
-      Func::Ptr new_func{store_, new_func_ref};
-      return DoCall(new_func, out_trap);
-    }
+      case O::LocalGet:
+        // TODO: need to mark whether this is a ref.
+        Push(Pick(instr.imm_u32));
+        break;
 
-    case O::InterpDropKeep: {
-      auto drop = instr.imm_u32x2.fst;
-      auto keep = instr.imm_u32x2.snd;
-      // Shift kept refs down.
-      for (auto iter = refs_.rbegin(); iter != refs_.rend(); ++iter) {
-        if (*iter >= values_.size() - keep) {
-          *iter -= drop;
+      case O::LocalSet: {
+        Pick(instr.imm_u32) = Pick(1);
+        Pop();
+        break;
+      }
+
+      case O::LocalTee:
+        Pick(instr.imm_u32) = Pick(1);
+        break;
+
+      case O::GlobalGet: {
+        // TODO: need to mark whether this is a ref.
+        Global::Ptr global{store_, inst_->globals()[instr.imm_u32]};
+        Push(global->Get());
+        break;
+      }
+
+      case O::GlobalSet: {
+        Global::Ptr global{store_, inst_->globals()[instr.imm_u32]};
+        global->UnsafeSet(Pop());
+        break;
+      }
+
+      case O::I32Load:
+        RETURN_IF((DoLoad<u32>(instr, out_trap)));
+      case O::I64Load:
+        RETURN_IF((DoLoad<u64>(instr, out_trap)));
+      case O::F32Load:
+        RETURN_IF((DoLoad<f32>(instr, out_trap)));
+      case O::F64Load:
+        RETURN_IF((DoLoad<f64>(instr, out_trap)));
+      case O::I32Load8S:
+        RETURN_IF((DoLoad<s32, s8>(instr, out_trap)));
+      case O::I32Load8U:
+        RETURN_IF((DoLoad<u32, u8>(instr, out_trap)));
+      case O::I32Load16S:
+        RETURN_IF((DoLoad<s32, s16>(instr, out_trap)));
+      case O::I32Load16U:
+        RETURN_IF((DoLoad<u32, u16>(instr, out_trap)));
+      case O::I64Load8S:
+        RETURN_IF((DoLoad<s64, s8>(instr, out_trap)));
+      case O::I64Load8U:
+        RETURN_IF((DoLoad<u64, u8>(instr, out_trap)));
+      case O::I64Load16S:
+        RETURN_IF((DoLoad<s64, s16>(instr, out_trap)));
+      case O::I64Load16U:
+        RETURN_IF((DoLoad<u64, u16>(instr, out_trap)));
+      case O::I64Load32S:
+        RETURN_IF((DoLoad<s64, s32>(instr, out_trap)));
+      case O::I64Load32U:
+        RETURN_IF((DoLoad<u64, u32>(instr, out_trap)));
+
+      case O::I32Store:
+        RETURN_IF((DoStore<u32>(instr, out_trap)));
+      case O::I64Store:
+        RETURN_IF((DoStore<u64>(instr, out_trap)));
+      case O::F32Store:
+        RETURN_IF((DoStore<f32>(instr, out_trap)));
+      case O::F64Store:
+        RETURN_IF((DoStore<f64>(instr, out_trap)));
+      case O::I32Store8:
+        RETURN_IF((DoStore<u32, u8>(instr, out_trap)));
+      case O::I32Store16:
+        RETURN_IF((DoStore<u32, u16>(instr, out_trap)));
+      case O::I64Store8:
+        RETURN_IF((DoStore<u64, u8>(instr, out_trap)));
+      case O::I64Store16:
+        RETURN_IF((DoStore<u64, u16>(instr, out_trap)));
+      case O::I64Store32:
+        RETURN_IF((DoStore<u64, u32>(instr, out_trap)));
+
+      case O::MemorySize: {
+        Memory::Ptr memory{store_, inst_->memories()[instr.imm_u32]};
+        if (memory->type().limits.is_64) {
+          Push<u64>(memory->PageSize());
         } else {
-          break;
+          Push<u32>(static_cast<u32>(memory->PageSize()));
         }
+        break;
       }
-      std::move(values_.end() - keep, values_.end(),
-                values_.end() - drop - keep);
-      values_.resize(values_.size() - drop);
-      break;
-    }
 
-    case O::InterpCatchDrop: {
-      auto drop = instr.imm_u32;
-      for (u32 i = 0; i < drop; i++) {
-        exceptions_.pop_back();
+      case O::MemoryGrow: {
+        Memory::Ptr memory{store_, inst_->memories()[instr.imm_u32]};
+        u64 old_size = memory->PageSize();
+        if (memory->type().limits.is_64) {
+          if (Failed(memory->Grow(Pop<u64>()))) {
+            Push<s64>(-1);
+          } else {
+            Push<u64>(old_size);
+          }
+        } else {
+          if (Failed(memory->Grow(Pop<u32>()))) {
+            Push<s32>(-1);
+          } else {
+            Push<u32>(old_size);
+          }
+        }
+        break;
       }
-      break;
+
+      case O::I32Const:
+        Push(instr.imm_u32);
+        break;
+      case O::F32Const:
+        Push(instr.imm_f32);
+        break;
+      case O::I64Const:
+        Push(instr.imm_u64);
+        break;
+      case O::F64Const:
+        Push(instr.imm_f64);
+        break;
+
+      case O::I32Eqz:
+        RETURN_IF((DoUnop(IntEqz<u32>)));
+      case O::I32Eq:
+        RETURN_IF((DoBinop(Eq<u32>)));
+      case O::I32Ne:
+        RETURN_IF((DoBinop(Ne<u32>)));
+      case O::I32LtS:
+        RETURN_IF((DoBinop(Lt<s32>)));
+      case O::I32LtU:
+        RETURN_IF((DoBinop(Lt<u32>)));
+      case O::I32GtS:
+        RETURN_IF((DoBinop(Gt<s32>)));
+      case O::I32GtU:
+        RETURN_IF((DoBinop(Gt<u32>)));
+      case O::I32LeS:
+        RETURN_IF((DoBinop(Le<s32>)));
+      case O::I32LeU:
+        RETURN_IF((DoBinop(Le<u32>)));
+      case O::I32GeS:
+        RETURN_IF((DoBinop(Ge<s32>)));
+      case O::I32GeU:
+        RETURN_IF((DoBinop(Ge<u32>)));
+
+      case O::I64Eqz:
+        RETURN_IF((DoUnop(IntEqz<u64>)));
+      case O::I64Eq:
+        RETURN_IF((DoBinop(Eq<u64>)));
+      case O::I64Ne:
+        RETURN_IF((DoBinop(Ne<u64>)));
+      case O::I64LtS:
+        RETURN_IF((DoBinop(Lt<s64>)));
+      case O::I64LtU:
+        RETURN_IF((DoBinop(Lt<u64>)));
+      case O::I64GtS:
+        RETURN_IF((DoBinop(Gt<s64>)));
+      case O::I64GtU:
+        RETURN_IF((DoBinop(Gt<u64>)));
+      case O::I64LeS:
+        RETURN_IF((DoBinop(Le<s64>)));
+      case O::I64LeU:
+        RETURN_IF((DoBinop(Le<u64>)));
+      case O::I64GeS:
+        RETURN_IF((DoBinop(Ge<s64>)));
+      case O::I64GeU:
+        RETURN_IF((DoBinop(Ge<u64>)));
+
+      case O::F32Eq:
+        RETURN_IF((DoBinop(Eq<f32>)));
+      case O::F32Ne:
+        RETURN_IF((DoBinop(Ne<f32>)));
+      case O::F32Lt:
+        RETURN_IF((DoBinop(Lt<f32>)));
+      case O::F32Gt:
+        RETURN_IF((DoBinop(Gt<f32>)));
+      case O::F32Le:
+        RETURN_IF((DoBinop(Le<f32>)));
+      case O::F32Ge:
+        RETURN_IF((DoBinop(Ge<f32>)));
+
+      case O::F64Eq:
+        RETURN_IF((DoBinop(Eq<f64>)));
+      case O::F64Ne:
+        RETURN_IF((DoBinop(Ne<f64>)));
+      case O::F64Lt:
+        RETURN_IF((DoBinop(Lt<f64>)));
+      case O::F64Gt:
+        RETURN_IF((DoBinop(Gt<f64>)));
+      case O::F64Le:
+        RETURN_IF((DoBinop(Le<f64>)));
+      case O::F64Ge:
+        RETURN_IF((DoBinop(Ge<f64>)));
+
+      case O::I32Clz:
+        RETURN_IF((DoUnop(IntClz<u32>)));
+      case O::I32Ctz:
+        RETURN_IF((DoUnop(IntCtz<u32>)));
+      case O::I32Popcnt:
+        RETURN_IF((DoUnop(IntPopcnt<u32>)));
+      case O::I32Add:
+        RETURN_IF((DoBinop(Add<u32>)));
+      case O::I32Sub:
+        RETURN_IF((DoBinop(Sub<u32>)));
+      case O::I32Mul:
+        RETURN_IF((DoBinop(Mul<u32>)));
+      case O::I32DivS:
+        RETURN_IF((DoBinop(IntDiv<s32>, out_trap)));
+      case O::I32DivU:
+        RETURN_IF((DoBinop(IntDiv<u32>, out_trap)));
+      case O::I32RemS:
+        RETURN_IF((DoBinop(IntRem<s32>, out_trap)));
+      case O::I32RemU:
+        RETURN_IF((DoBinop(IntRem<u32>, out_trap)));
+      case O::I32And:
+        RETURN_IF((DoBinop(IntAnd<u32>)));
+      case O::I32Or:
+        RETURN_IF((DoBinop(IntOr<u32>)));
+      case O::I32Xor:
+        RETURN_IF((DoBinop(IntXor<u32>)));
+      case O::I32Shl:
+        RETURN_IF((DoBinop(IntShl<u32>)));
+      case O::I32ShrS:
+        RETURN_IF((DoBinop(IntShr<s32>)));
+      case O::I32ShrU:
+        RETURN_IF((DoBinop(IntShr<u32>)));
+      case O::I32Rotl:
+        RETURN_IF((DoBinop(IntRotl<u32>)));
+      case O::I32Rotr:
+        RETURN_IF((DoBinop(IntRotr<u32>)));
+
+      case O::I64Clz:
+        RETURN_IF((DoUnop(IntClz<u64>)));
+      case O::I64Ctz:
+        RETURN_IF((DoUnop(IntCtz<u64>)));
+      case O::I64Popcnt:
+        RETURN_IF((DoUnop(IntPopcnt<u64>)));
+      case O::I64Add:
+        RETURN_IF((DoBinop(Add<u64>)));
+      case O::I64Sub:
+        RETURN_IF((DoBinop(Sub<u64>)));
+      case O::I64Mul:
+        RETURN_IF((DoBinop(Mul<u64>)));
+      case O::I64DivS:
+        RETURN_IF((DoBinop(IntDiv<s64>, out_trap)));
+      case O::I64DivU:
+        RETURN_IF((DoBinop(IntDiv<u64>, out_trap)));
+      case O::I64RemS:
+        RETURN_IF((DoBinop(IntRem<s64>, out_trap)));
+      case O::I64RemU:
+        RETURN_IF((DoBinop(IntRem<u64>, out_trap)));
+      case O::I64And:
+        RETURN_IF((DoBinop(IntAnd<u64>)));
+      case O::I64Or:
+        RETURN_IF((DoBinop(IntOr<u64>)));
+      case O::I64Xor:
+        RETURN_IF((DoBinop(IntXor<u64>)));
+      case O::I64Shl:
+        RETURN_IF((DoBinop(IntShl<u64>)));
+      case O::I64ShrS:
+        RETURN_IF((DoBinop(IntShr<s64>)));
+      case O::I64ShrU:
+        RETURN_IF((DoBinop(IntShr<u64>)));
+      case O::I64Rotl:
+        RETURN_IF((DoBinop(IntRotl<u64>)));
+      case O::I64Rotr:
+        RETURN_IF((DoBinop(IntRotr<u64>)));
+
+      case O::F32Abs:
+        RETURN_IF((DoUnop(FloatAbs<f32>)));
+      case O::F32Neg:
+        RETURN_IF((DoUnop(FloatNeg<f32>)));
+      case O::F32Ceil:
+        RETURN_IF((DoUnop(FloatCeil<f32>)));
+      case O::F32Floor:
+        RETURN_IF((DoUnop(FloatFloor<f32>)));
+      case O::F32Trunc:
+        RETURN_IF((DoUnop(FloatTrunc<f32>)));
+      case O::F32Nearest:
+        RETURN_IF((DoUnop(FloatNearest<f32>)));
+      case O::F32Sqrt:
+        RETURN_IF((DoUnop(FloatSqrt<f32>)));
+      case O::F32Add:
+        RETURN_IF((DoBinop(Add<f32>)));
+      case O::F32Sub:
+        RETURN_IF((DoBinop(Sub<f32>)));
+      case O::F32Mul:
+        RETURN_IF((DoBinop(Mul<f32>)));
+      case O::F32Div:
+        RETURN_IF((DoBinop(FloatDiv<f32>)));
+      case O::F32Min:
+        RETURN_IF((DoBinop(FloatMin<f32>)));
+      case O::F32Max:
+        RETURN_IF((DoBinop(FloatMax<f32>)));
+      case O::F32Copysign:
+        RETURN_IF((DoBinop(FloatCopysign<f32>)));
+
+      case O::F64Abs:
+        RETURN_IF((DoUnop(FloatAbs<f64>)));
+      case O::F64Neg:
+        RETURN_IF((DoUnop(FloatNeg<f64>)));
+      case O::F64Ceil:
+        RETURN_IF((DoUnop(FloatCeil<f64>)));
+      case O::F64Floor:
+        RETURN_IF((DoUnop(FloatFloor<f64>)));
+      case O::F64Trunc:
+        RETURN_IF((DoUnop(FloatTrunc<f64>)));
+      case O::F64Nearest:
+        RETURN_IF((DoUnop(FloatNearest<f64>)));
+      case O::F64Sqrt:
+        RETURN_IF((DoUnop(FloatSqrt<f64>)));
+      case O::F64Add:
+        RETURN_IF((DoBinop(Add<f64>)));
+      case O::F64Sub:
+        RETURN_IF((DoBinop(Sub<f64>)));
+      case O::F64Mul:
+        RETURN_IF((DoBinop(Mul<f64>)));
+      case O::F64Div:
+        RETURN_IF((DoBinop(FloatDiv<f64>)));
+      case O::F64Min:
+        RETURN_IF((DoBinop(FloatMin<f64>)));
+      case O::F64Max:
+        RETURN_IF((DoBinop(FloatMax<f64>)));
+      case O::F64Copysign:
+        RETURN_IF((DoBinop(FloatCopysign<f64>)));
+
+      case O::I32WrapI64:
+        RETURN_IF((DoConvert<u32, u64>(out_trap)));
+      case O::I32TruncF32S:
+        RETURN_IF((DoConvert<s32, f32>(out_trap)));
+      case O::I32TruncF32U:
+        RETURN_IF((DoConvert<u32, f32>(out_trap)));
+      case O::I32TruncF64S:
+        RETURN_IF((DoConvert<s32, f64>(out_trap)));
+      case O::I32TruncF64U:
+        RETURN_IF((DoConvert<u32, f64>(out_trap)));
+      case O::I64ExtendI32S:
+        RETURN_IF((DoConvert<s64, s32>(out_trap)));
+      case O::I64ExtendI32U:
+        RETURN_IF((DoConvert<u64, u32>(out_trap)));
+      case O::I64TruncF32S:
+        RETURN_IF((DoConvert<s64, f32>(out_trap)));
+      case O::I64TruncF32U:
+        RETURN_IF((DoConvert<u64, f32>(out_trap)));
+      case O::I64TruncF64S:
+        RETURN_IF((DoConvert<s64, f64>(out_trap)));
+      case O::I64TruncF64U:
+        RETURN_IF((DoConvert<u64, f64>(out_trap)));
+      case O::F32ConvertI32S:
+        RETURN_IF((DoConvert<f32, s32>(out_trap)));
+      case O::F32ConvertI32U:
+        RETURN_IF((DoConvert<f32, u32>(out_trap)));
+      case O::F32ConvertI64S:
+        RETURN_IF((DoConvert<f32, s64>(out_trap)));
+      case O::F32ConvertI64U:
+        RETURN_IF((DoConvert<f32, u64>(out_trap)));
+      case O::F32DemoteF64:
+        RETURN_IF((DoConvert<f32, f64>(out_trap)));
+      case O::F64ConvertI32S:
+        RETURN_IF((DoConvert<f64, s32>(out_trap)));
+      case O::F64ConvertI32U:
+        RETURN_IF((DoConvert<f64, u32>(out_trap)));
+      case O::F64ConvertI64S:
+        RETURN_IF((DoConvert<f64, s64>(out_trap)));
+      case O::F64ConvertI64U:
+        RETURN_IF((DoConvert<f64, u64>(out_trap)));
+      case O::F64PromoteF32:
+        RETURN_IF((DoConvert<f64, f32>(out_trap)));
+
+      case O::I32ReinterpretF32:
+        RETURN_IF((DoReinterpret<u32, f32>()));
+      case O::F32ReinterpretI32:
+        RETURN_IF((DoReinterpret<f32, u32>()));
+      case O::I64ReinterpretF64:
+        RETURN_IF((DoReinterpret<u64, f64>()));
+      case O::F64ReinterpretI64:
+        RETURN_IF((DoReinterpret<f64, u64>()));
+
+      case O::I32Extend8S:
+        RETURN_IF((DoUnop(IntExtend<u32, 7>)));
+      case O::I32Extend16S:
+        RETURN_IF((DoUnop(IntExtend<u32, 15>)));
+      case O::I64Extend8S:
+        RETURN_IF((DoUnop(IntExtend<u64, 7>)));
+      case O::I64Extend16S:
+        RETURN_IF((DoUnop(IntExtend<u64, 15>)));
+      case O::I64Extend32S:
+        RETURN_IF((DoUnop(IntExtend<u64, 31>)));
+
+      case O::InterpAlloca:
+        values_.resize(values_.size() + instr.imm_u32);
+        // refs_ doesn't need to be updated; We may be allocating space for
+        // references, but they will be initialized to null, so it is OK if we
+        // don't mark them.
+        break;
+
+      case O::InterpBrUnless:
+        if (!Pop<u32>()) {
+          pc = instr.imm_u32;
+        }
+        break;
+
+      case O::InterpCallImport: {
+        Ref new_func_ref = inst_->funcs()[instr.imm_u32];
+        Func::Ptr new_func{store_, new_func_ref};
+        RETURN_IF((DoCall(new_func, out_trap)));
+      }
+
+      case O::InterpDropKeep: {
+        auto drop = instr.imm_u32x2.fst;
+        auto keep = instr.imm_u32x2.snd;
+        // Shift kept refs down.
+        for (auto iter = refs_.rbegin(); iter != refs_.rend(); ++iter) {
+          if (*iter >= values_.size() - keep) {
+            *iter -= drop;
+          } else {
+            break;
+          }
+        }
+        std::move(values_.end() - keep, values_.end(),
+                  values_.end() - drop - keep);
+        values_.resize(values_.size() - drop);
+        break;
+      }
+
+      case O::InterpCatchDrop: {
+        auto drop = instr.imm_u32;
+        for (u32 i = 0; i < drop; i++) {
+          exceptions_.pop_back();
+        }
+        break;
+      }
+
+      // This operation adjusts the function reference of the reused frame
+      // after a return_call. This ensures the correct exception handlers are
+      // used for the call.
+      case O::InterpAdjustFrameForReturnCall: {
+        Ref new_func_ref = inst_->funcs()[instr.imm_u32];
+        Frame& current_frame = frames_.back();
+        current_frame.func = new_func_ref;
+        break;
+      }
+
+      case O::I32TruncSatF32S:
+        RETURN_IF((DoUnop(IntTruncSat<s32, f32>)));
+      case O::I32TruncSatF32U:
+        RETURN_IF((DoUnop(IntTruncSat<u32, f32>)));
+      case O::I32TruncSatF64S:
+        RETURN_IF((DoUnop(IntTruncSat<s32, f64>)));
+      case O::I32TruncSatF64U:
+        RETURN_IF((DoUnop(IntTruncSat<u32, f64>)));
+      case O::I64TruncSatF32S:
+        RETURN_IF((DoUnop(IntTruncSat<s64, f32>)));
+      case O::I64TruncSatF32U:
+        RETURN_IF((DoUnop(IntTruncSat<u64, f32>)));
+      case O::I64TruncSatF64S:
+        RETURN_IF((DoUnop(IntTruncSat<s64, f64>)));
+      case O::I64TruncSatF64U:
+        RETURN_IF((DoUnop(IntTruncSat<u64, f64>)));
+
+      case O::MemoryInit:
+        RETURN_IF((DoMemoryInit(instr, out_trap)));
+      case O::DataDrop:
+        RETURN_IF((DoDataDrop(instr)));
+      case O::MemoryCopy:
+        RETURN_IF((DoMemoryCopy(instr, out_trap)));
+      case O::MemoryFill:
+        RETURN_IF((DoMemoryFill(instr, out_trap)));
+
+      case O::TableInit:
+        RETURN_IF((DoTableInit(instr, out_trap)));
+      case O::ElemDrop:
+        RETURN_IF((DoElemDrop(instr)));
+      case O::TableCopy:
+        RETURN_IF((DoTableCopy(instr, out_trap)));
+      case O::TableGet:
+        RETURN_IF((DoTableGet(instr, out_trap)));
+      case O::TableSet:
+        RETURN_IF((DoTableSet(instr, out_trap)));
+      case O::TableGrow:
+        RETURN_IF((DoTableGrow(instr, out_trap)));
+      case O::TableSize:
+        RETURN_IF((DoTableSize(instr)));
+      case O::TableFill:
+        RETURN_IF((DoTableFill(instr, out_trap)));
+
+      case O::RefNull:
+        Push(Ref::Null);
+        break;
+
+      case O::RefIsNull:
+        Push(Pop<Ref>() == Ref::Null);
+        break;
+
+      case O::RefFunc:
+        Push(inst_->funcs()[instr.imm_u32]);
+        break;
+
+      case O::V128Load:
+        RETURN_IF((DoLoad<v128>(instr, out_trap)));
+      case O::V128Store:
+        RETURN_IF((DoStore<v128>(instr, out_trap)));
+
+      case O::V128Const:
+        Push<v128>(instr.imm_v128);
+        break;
+
+      case O::I8X16Splat:
+        RETURN_IF((DoSimdSplat<u8x16, u32>()));
+      case O::I8X16ExtractLaneS:
+        RETURN_IF((DoSimdExtract<s8x16, s32>(instr)));
+      case O::I8X16ExtractLaneU:
+        RETURN_IF((DoSimdExtract<u8x16, u32>(instr)));
+      case O::I8X16ReplaceLane:
+        RETURN_IF((DoSimdReplace<u8x16, u32>(instr)));
+      case O::I16X8Splat:
+        RETURN_IF((DoSimdSplat<u16x8, u32>()));
+      case O::I16X8ExtractLaneS:
+        RETURN_IF((DoSimdExtract<s16x8, s32>(instr)));
+      case O::I16X8ExtractLaneU:
+        RETURN_IF((DoSimdExtract<u16x8, u32>(instr)));
+      case O::I16X8ReplaceLane:
+        RETURN_IF((DoSimdReplace<u16x8, u32>(instr)));
+      case O::I32X4Splat:
+        RETURN_IF((DoSimdSplat<u32x4, u32>()));
+      case O::I32X4ExtractLane:
+        RETURN_IF((DoSimdExtract<s32x4, u32>(instr)));
+      case O::I32X4ReplaceLane:
+        RETURN_IF((DoSimdReplace<u32x4, u32>(instr)));
+      case O::I64X2Splat:
+        RETURN_IF((DoSimdSplat<u64x2, u64>()));
+      case O::I64X2ExtractLane:
+        RETURN_IF((DoSimdExtract<u64x2, u64>(instr)));
+      case O::I64X2ReplaceLane:
+        RETURN_IF((DoSimdReplace<u64x2, u64>(instr)));
+      case O::F32X4Splat:
+        RETURN_IF((DoSimdSplat<f32x4, f32>()));
+      case O::F32X4ExtractLane:
+        RETURN_IF((DoSimdExtract<f32x4, f32>(instr)));
+      case O::F32X4ReplaceLane:
+        RETURN_IF((DoSimdReplace<f32x4, f32>(instr)));
+      case O::F64X2Splat:
+        RETURN_IF((DoSimdSplat<f64x2, f64>()));
+      case O::F64X2ExtractLane:
+        RETURN_IF((DoSimdExtract<f64x2, f64>(instr)));
+      case O::F64X2ReplaceLane:
+        RETURN_IF((DoSimdReplace<f64x2, f64>(instr)));
+
+      case O::I8X16Eq:
+        RETURN_IF((DoSimdBinop(EqMask<u8>)));
+      case O::I8X16Ne:
+        RETURN_IF((DoSimdBinop(NeMask<u8>)));
+      case O::I8X16LtS:
+        RETURN_IF((DoSimdBinop(LtMask<s8>)));
+      case O::I8X16LtU:
+        RETURN_IF((DoSimdBinop(LtMask<u8>)));
+      case O::I8X16GtS:
+        RETURN_IF((DoSimdBinop(GtMask<s8>)));
+      case O::I8X16GtU:
+        RETURN_IF((DoSimdBinop(GtMask<u8>)));
+      case O::I8X16LeS:
+        RETURN_IF((DoSimdBinop(LeMask<s8>)));
+      case O::I8X16LeU:
+        RETURN_IF((DoSimdBinop(LeMask<u8>)));
+      case O::I8X16GeS:
+        RETURN_IF((DoSimdBinop(GeMask<s8>)));
+      case O::I8X16GeU:
+        RETURN_IF((DoSimdBinop(GeMask<u8>)));
+      case O::I16X8Eq:
+        RETURN_IF((DoSimdBinop(EqMask<u16>)));
+      case O::I16X8Ne:
+        RETURN_IF((DoSimdBinop(NeMask<u16>)));
+      case O::I16X8LtS:
+        RETURN_IF((DoSimdBinop(LtMask<s16>)));
+      case O::I16X8LtU:
+        RETURN_IF((DoSimdBinop(LtMask<u16>)));
+      case O::I16X8GtS:
+        RETURN_IF((DoSimdBinop(GtMask<s16>)));
+      case O::I16X8GtU:
+        RETURN_IF((DoSimdBinop(GtMask<u16>)));
+      case O::I16X8LeS:
+        RETURN_IF((DoSimdBinop(LeMask<s16>)));
+      case O::I16X8LeU:
+        RETURN_IF((DoSimdBinop(LeMask<u16>)));
+      case O::I16X8GeS:
+        RETURN_IF((DoSimdBinop(GeMask<s16>)));
+      case O::I16X8GeU:
+        RETURN_IF((DoSimdBinop(GeMask<u16>)));
+      case O::I32X4Eq:
+        RETURN_IF((DoSimdBinop(EqMask<u32>)));
+      case O::I32X4Ne:
+        RETURN_IF((DoSimdBinop(NeMask<u32>)));
+      case O::I32X4LtS:
+        RETURN_IF((DoSimdBinop(LtMask<s32>)));
+      case O::I32X4LtU:
+        RETURN_IF((DoSimdBinop(LtMask<u32>)));
+      case O::I32X4GtS:
+        RETURN_IF((DoSimdBinop(GtMask<s32>)));
+      case O::I32X4GtU:
+        RETURN_IF((DoSimdBinop(GtMask<u32>)));
+      case O::I32X4LeS:
+        RETURN_IF((DoSimdBinop(LeMask<s32>)));
+      case O::I32X4LeU:
+        RETURN_IF((DoSimdBinop(LeMask<u32>)));
+      case O::I32X4GeS:
+        RETURN_IF((DoSimdBinop(GeMask<s32>)));
+      case O::I32X4GeU:
+        RETURN_IF((DoSimdBinop(GeMask<u32>)));
+      case O::I64X2Eq:
+        RETURN_IF((DoSimdBinop(EqMask<u64>)));
+      case O::I64X2Ne:
+        RETURN_IF((DoSimdBinop(NeMask<u64>)));
+      case O::I64X2LtS:
+        RETURN_IF((DoSimdBinop(LtMask<s64>)));
+      case O::I64X2GtS:
+        RETURN_IF((DoSimdBinop(GtMask<s64>)));
+      case O::I64X2LeS:
+        RETURN_IF((DoSimdBinop(LeMask<s64>)));
+      case O::I64X2GeS:
+        RETURN_IF((DoSimdBinop(GeMask<s64>)));
+      case O::F32X4Eq:
+        RETURN_IF((DoSimdBinop(EqMask<f32>)));
+      case O::F32X4Ne:
+        RETURN_IF((DoSimdBinop(NeMask<f32>)));
+      case O::F32X4Lt:
+        RETURN_IF((DoSimdBinop(LtMask<f32>)));
+      case O::F32X4Gt:
+        RETURN_IF((DoSimdBinop(GtMask<f32>)));
+      case O::F32X4Le:
+        RETURN_IF((DoSimdBinop(LeMask<f32>)));
+      case O::F32X4Ge:
+        RETURN_IF((DoSimdBinop(GeMask<f32>)));
+      case O::F64X2Eq:
+        RETURN_IF((DoSimdBinop(EqMask<f64>)));
+      case O::F64X2Ne:
+        RETURN_IF((DoSimdBinop(NeMask<f64>)));
+      case O::F64X2Lt:
+        RETURN_IF((DoSimdBinop(LtMask<f64>)));
+      case O::F64X2Gt:
+        RETURN_IF((DoSimdBinop(GtMask<f64>)));
+      case O::F64X2Le:
+        RETURN_IF((DoSimdBinop(LeMask<f64>)));
+      case O::F64X2Ge:
+        RETURN_IF((DoSimdBinop(GeMask<f64>)));
+
+      case O::V128Not:
+        RETURN_IF((DoSimdUnop(IntNot<u64>)));
+      case O::V128And:
+        RETURN_IF((DoSimdBinop(IntAnd<u64>)));
+      case O::V128Or:
+        RETURN_IF((DoSimdBinop(IntOr<u64>)));
+      case O::V128Xor:
+        RETURN_IF((DoSimdBinop(IntXor<u64>)));
+      case O::V128BitSelect:
+        RETURN_IF((DoSimdBitSelect()));
+      case O::V128AnyTrue:
+        RETURN_IF((DoSimdIsTrue<u8x16, 1>()));
+
+      case O::I8X16Neg:
+        RETURN_IF((DoSimdUnop(IntNeg<u8>)));
+      case O::I8X16Bitmask:
+        RETURN_IF((DoSimdBitmask<s8x16>()));
+      case O::I8X16AllTrue:
+        RETURN_IF((DoSimdIsTrue<u8x16, 16>()));
+      case O::I8X16Shl:
+        RETURN_IF((DoSimdShift(IntShl<u8>)));
+      case O::I8X16ShrS:
+        RETURN_IF((DoSimdShift(IntShr<s8>)));
+      case O::I8X16ShrU:
+        RETURN_IF((DoSimdShift(IntShr<u8>)));
+      case O::I8X16Add:
+        RETURN_IF((DoSimdBinop(Add<u8>)));
+      case O::I8X16AddSatS:
+        RETURN_IF((DoSimdBinop(IntAddSat<s8>)));
+      case O::I8X16AddSatU:
+        RETURN_IF((DoSimdBinop(IntAddSat<u8>)));
+      case O::I8X16Sub:
+        RETURN_IF((DoSimdBinop(Sub<u8>)));
+      case O::I8X16SubSatS:
+        RETURN_IF((DoSimdBinop(IntSubSat<s8>)));
+      case O::I8X16SubSatU:
+        RETURN_IF((DoSimdBinop(IntSubSat<u8>)));
+      case O::I8X16MinS:
+        RETURN_IF((DoSimdBinop(IntMin<s8>)));
+      case O::I8X16MinU:
+        RETURN_IF((DoSimdBinop(IntMin<u8>)));
+      case O::I8X16MaxS:
+        RETURN_IF((DoSimdBinop(IntMax<s8>)));
+      case O::I8X16MaxU:
+        RETURN_IF((DoSimdBinop(IntMax<u8>)));
+
+      case O::I16X8Neg:
+        RETURN_IF((DoSimdUnop(IntNeg<u16>)));
+      case O::I16X8Bitmask:
+        RETURN_IF((DoSimdBitmask<s16x8>()));
+      case O::I16X8AllTrue:
+        RETURN_IF((DoSimdIsTrue<u16x8, 8>()));
+      case O::I16X8Shl:
+        RETURN_IF((DoSimdShift(IntShl<u16>)));
+      case O::I16X8ShrS:
+        RETURN_IF((DoSimdShift(IntShr<s16>)));
+      case O::I16X8ShrU:
+        RETURN_IF((DoSimdShift(IntShr<u16>)));
+      case O::I16X8Add:
+        RETURN_IF((DoSimdBinop(Add<u16>)));
+      case O::I16X8AddSatS:
+        RETURN_IF((DoSimdBinop(IntAddSat<s16>)));
+      case O::I16X8AddSatU:
+        RETURN_IF((DoSimdBinop(IntAddSat<u16>)));
+      case O::I16X8Sub:
+        RETURN_IF((DoSimdBinop(Sub<u16>)));
+      case O::I16X8SubSatS:
+        RETURN_IF((DoSimdBinop(IntSubSat<s16>)));
+      case O::I16X8SubSatU:
+        RETURN_IF((DoSimdBinop(IntSubSat<u16>)));
+      case O::I16X8Mul:
+        RETURN_IF((DoSimdBinop(Mul<u16>)));
+      case O::I16X8MinS:
+        RETURN_IF((DoSimdBinop(IntMin<s16>)));
+      case O::I16X8MinU:
+        RETURN_IF((DoSimdBinop(IntMin<u16>)));
+      case O::I16X8MaxS:
+        RETURN_IF((DoSimdBinop(IntMax<s16>)));
+      case O::I16X8MaxU:
+        RETURN_IF((DoSimdBinop(IntMax<u16>)));
+
+      case O::I32X4Neg:
+        RETURN_IF((DoSimdUnop(IntNeg<u32>)));
+      case O::I32X4Bitmask:
+        RETURN_IF((DoSimdBitmask<s32x4>()));
+      case O::I32X4AllTrue:
+        RETURN_IF((DoSimdIsTrue<u32x4, 4>()));
+      case O::I32X4Shl:
+        RETURN_IF((DoSimdShift(IntShl<u32>)));
+      case O::I32X4ShrS:
+        RETURN_IF((DoSimdShift(IntShr<s32>)));
+      case O::I32X4ShrU:
+        RETURN_IF((DoSimdShift(IntShr<u32>)));
+      case O::I32X4Add:
+        RETURN_IF((DoSimdBinop(Add<u32>)));
+      case O::I32X4Sub:
+        RETURN_IF((DoSimdBinop(Sub<u32>)));
+      case O::I32X4Mul:
+        RETURN_IF((DoSimdBinop(Mul<u32>)));
+      case O::I32X4MinS:
+        RETURN_IF((DoSimdBinop(IntMin<s32>)));
+      case O::I32X4MinU:
+        RETURN_IF((DoSimdBinop(IntMin<u32>)));
+      case O::I32X4MaxS:
+        RETURN_IF((DoSimdBinop(IntMax<s32>)));
+      case O::I32X4MaxU:
+        RETURN_IF((DoSimdBinop(IntMax<u32>)));
+
+      case O::I64X2Neg:
+        RETURN_IF((DoSimdUnop(IntNeg<u64>)));
+      case O::I64X2Bitmask:
+        RETURN_IF((DoSimdBitmask<s64x2>()));
+      case O::I64X2AllTrue:
+        RETURN_IF((DoSimdIsTrue<u64x2, 2>()));
+      case O::I64X2Shl:
+        RETURN_IF((DoSimdShift(IntShl<u64>)));
+      case O::I64X2ShrS:
+        RETURN_IF((DoSimdShift(IntShr<s64>)));
+      case O::I64X2ShrU:
+        RETURN_IF((DoSimdShift(IntShr<u64>)));
+      case O::I64X2Add:
+        RETURN_IF((DoSimdBinop(Add<u64>)));
+      case O::I64X2Sub:
+        RETURN_IF((DoSimdBinop(Sub<u64>)));
+      case O::I64X2Mul:
+        RETURN_IF((DoSimdBinop(Mul<u64>)));
+
+      case O::F32X4Ceil:
+        RETURN_IF((DoSimdUnop(FloatCeil<f32>)));
+      case O::F32X4Floor:
+        RETURN_IF((DoSimdUnop(FloatFloor<f32>)));
+      case O::F32X4Trunc:
+        RETURN_IF((DoSimdUnop(FloatTrunc<f32>)));
+      case O::F32X4Nearest:
+        RETURN_IF((DoSimdUnop(FloatNearest<f32>)));
+
+      case O::F64X2Ceil:
+        RETURN_IF((DoSimdUnop(FloatCeil<f64>)));
+      case O::F64X2Floor:
+        RETURN_IF((DoSimdUnop(FloatFloor<f64>)));
+      case O::F64X2Trunc:
+        RETURN_IF((DoSimdUnop(FloatTrunc<f64>)));
+      case O::F64X2Nearest:
+        RETURN_IF((DoSimdUnop(FloatNearest<f64>)));
+
+      case O::F32X4Abs:
+        RETURN_IF((DoSimdUnop(FloatAbs<f32>)));
+      case O::F32X4Neg:
+        RETURN_IF((DoSimdUnop(FloatNeg<f32>)));
+      case O::F32X4Sqrt:
+        RETURN_IF((DoSimdUnop(FloatSqrt<f32>)));
+      case O::F32X4Add:
+        RETURN_IF((DoSimdBinop(Add<f32>)));
+      case O::F32X4Sub:
+        RETURN_IF((DoSimdBinop(Sub<f32>)));
+      case O::F32X4Mul:
+        RETURN_IF((DoSimdBinop(Mul<f32>)));
+      case O::F32X4Div:
+        RETURN_IF((DoSimdBinop(FloatDiv<f32>)));
+      case O::F32X4Min:
+        RETURN_IF((DoSimdBinop(FloatMin<f32>)));
+      case O::F32X4Max:
+        RETURN_IF((DoSimdBinop(FloatMax<f32>)));
+      case O::F32X4PMin:
+        RETURN_IF((DoSimdBinop(FloatPMin<f32>)));
+      case O::F32X4PMax:
+        RETURN_IF((DoSimdBinop(FloatPMax<f32>)));
+
+      case O::F64X2Abs:
+        RETURN_IF((DoSimdUnop(FloatAbs<f64>)));
+      case O::F64X2Neg:
+        RETURN_IF((DoSimdUnop(FloatNeg<f64>)));
+      case O::F64X2Sqrt:
+        RETURN_IF((DoSimdUnop(FloatSqrt<f64>)));
+      case O::F64X2Add:
+        RETURN_IF((DoSimdBinop(Add<f64>)));
+      case O::F64X2Sub:
+        RETURN_IF((DoSimdBinop(Sub<f64>)));
+      case O::F64X2Mul:
+        RETURN_IF((DoSimdBinop(Mul<f64>)));
+      case O::F64X2Div:
+        RETURN_IF((DoSimdBinop(FloatDiv<f64>)));
+      case O::F64X2Min:
+        RETURN_IF((DoSimdBinop(FloatMin<f64>)));
+      case O::F64X2Max:
+        RETURN_IF((DoSimdBinop(FloatMax<f64>)));
+      case O::F64X2PMin:
+        RETURN_IF((DoSimdBinop(FloatPMin<f64>)));
+      case O::F64X2PMax:
+        RETURN_IF((DoSimdBinop(FloatPMax<f64>)));
+
+      case O::I32X4TruncSatF32X4S:
+        RETURN_IF((DoSimdUnop(IntTruncSat<s32, f32>)));
+      case O::I32X4TruncSatF32X4U:
+        RETURN_IF((DoSimdUnop(IntTruncSat<u32, f32>)));
+      case O::F32X4ConvertI32X4S:
+        RETURN_IF((DoSimdUnop(Convert<f32, s32>)));
+      case O::F32X4ConvertI32X4U:
+        RETURN_IF((DoSimdUnop(Convert<f32, u32>)));
+      case O::F32X4DemoteF64X2Zero:
+        RETURN_IF((DoSimdUnopZero(Convert<f32, f64>)));
+      case O::F64X2PromoteLowF32X4:
+        RETURN_IF((DoSimdConvert<f64x2, f32x4, true>()));
+      case O::I32X4TruncSatF64X2SZero:
+        RETURN_IF((DoSimdUnopZero(IntTruncSat<s32, f64>)));
+      case O::I32X4TruncSatF64X2UZero:
+        RETURN_IF((DoSimdUnopZero(IntTruncSat<u32, f64>)));
+      case O::F64X2ConvertLowI32X4S:
+        RETURN_IF((DoSimdConvert<f64x2, s32x4, true>()));
+      case O::F64X2ConvertLowI32X4U:
+        RETURN_IF((DoSimdConvert<f64x2, u32x4, true>()));
+
+      case O::I8X16Swizzle:
+        RETURN_IF((DoSimdSwizzle()));
+      case O::I8X16Shuffle:
+        RETURN_IF((DoSimdShuffle(instr)));
+
+      case O::V128Load8Splat:
+        RETURN_IF((DoSimdLoadSplat<u8x16>(instr, out_trap)));
+      case O::V128Load16Splat:
+        RETURN_IF((DoSimdLoadSplat<u16x8>(instr, out_trap)));
+      case O::V128Load32Splat:
+        RETURN_IF((DoSimdLoadSplat<u32x4>(instr, out_trap)));
+      case O::V128Load64Splat:
+        RETURN_IF((DoSimdLoadSplat<u64x2>(instr, out_trap)));
+
+      case O::V128Load8Lane:
+        RETURN_IF((DoSimdLoadLane<u8x16>(instr, out_trap)));
+      case O::V128Load16Lane:
+        RETURN_IF((DoSimdLoadLane<u16x8>(instr, out_trap)));
+      case O::V128Load32Lane:
+        RETURN_IF((DoSimdLoadLane<u32x4>(instr, out_trap)));
+      case O::V128Load64Lane:
+        RETURN_IF((DoSimdLoadLane<u64x2>(instr, out_trap)));
+
+      case O::V128Store8Lane:
+        RETURN_IF((DoSimdStoreLane<u8x16>(instr, out_trap)));
+      case O::V128Store16Lane:
+        RETURN_IF((DoSimdStoreLane<u16x8>(instr, out_trap)));
+      case O::V128Store32Lane:
+        RETURN_IF((DoSimdStoreLane<u32x4>(instr, out_trap)));
+      case O::V128Store64Lane:
+        RETURN_IF((DoSimdStoreLane<u64x2>(instr, out_trap)));
+
+      case O::V128Load32Zero:
+        RETURN_IF((DoSimdLoadZero<u32x4, u32>(instr, out_trap)));
+      case O::V128Load64Zero:
+        RETURN_IF((DoSimdLoadZero<u64x2, u64>(instr, out_trap)));
+
+      case O::I8X16NarrowI16X8S:
+        RETURN_IF((DoSimdNarrow<s8x16, s16x8>()));
+      case O::I8X16NarrowI16X8U:
+        RETURN_IF((DoSimdNarrow<u8x16, s16x8>()));
+      case O::I16X8NarrowI32X4S:
+        RETURN_IF((DoSimdNarrow<s16x8, s32x4>()));
+      case O::I16X8NarrowI32X4U:
+        RETURN_IF((DoSimdNarrow<u16x8, s32x4>()));
+      case O::I16X8ExtendLowI8X16S:
+        RETURN_IF((DoSimdConvert<s16x8, s8x16, true>()));
+      case O::I16X8ExtendHighI8X16S:
+        RETURN_IF((DoSimdConvert<s16x8, s8x16, false>()));
+      case O::I16X8ExtendLowI8X16U:
+        RETURN_IF((DoSimdConvert<u16x8, u8x16, true>()));
+      case O::I16X8ExtendHighI8X16U:
+        RETURN_IF((DoSimdConvert<u16x8, u8x16, false>()));
+      case O::I32X4ExtendLowI16X8S:
+        RETURN_IF((DoSimdConvert<s32x4, s16x8, true>()));
+      case O::I32X4ExtendHighI16X8S:
+        RETURN_IF((DoSimdConvert<s32x4, s16x8, false>()));
+      case O::I32X4ExtendLowI16X8U:
+        RETURN_IF((DoSimdConvert<u32x4, u16x8, true>()));
+      case O::I32X4ExtendHighI16X8U:
+        RETURN_IF((DoSimdConvert<u32x4, u16x8, false>()));
+      case O::I64X2ExtendLowI32X4S:
+        RETURN_IF((DoSimdConvert<s64x2, s32x4, true>()));
+      case O::I64X2ExtendHighI32X4S:
+        RETURN_IF((DoSimdConvert<s64x2, s32x4, false>()));
+      case O::I64X2ExtendLowI32X4U:
+        RETURN_IF((DoSimdConvert<u64x2, u32x4, true>()));
+      case O::I64X2ExtendHighI32X4U:
+        RETURN_IF((DoSimdConvert<u64x2, u32x4, false>()));
+
+      case O::V128Load8X8S:
+        RETURN_IF((DoSimdLoadExtend<s16x8, s8x8>(instr, out_trap)));
+      case O::V128Load8X8U:
+        RETURN_IF((DoSimdLoadExtend<u16x8, u8x8>(instr, out_trap)));
+      case O::V128Load16X4S:
+        RETURN_IF((DoSimdLoadExtend<s32x4, s16x4>(instr, out_trap)));
+      case O::V128Load16X4U:
+        RETURN_IF((DoSimdLoadExtend<u32x4, u16x4>(instr, out_trap)));
+      case O::V128Load32X2S:
+        RETURN_IF((DoSimdLoadExtend<s64x2, s32x2>(instr, out_trap)));
+      case O::V128Load32X2U:
+        RETURN_IF((DoSimdLoadExtend<u64x2, u32x2>(instr, out_trap)));
+
+      case O::V128Andnot:
+        RETURN_IF((DoSimdBinop(IntAndNot<u64>)));
+      case O::I8X16AvgrU:
+        RETURN_IF((DoSimdBinop(IntAvgr<u8>)));
+      case O::I16X8AvgrU:
+        RETURN_IF((DoSimdBinop(IntAvgr<u16>)));
+
+      case O::I8X16Abs:
+        RETURN_IF((DoSimdUnop(IntAbs<u8>)));
+      case O::I16X8Abs:
+        RETURN_IF((DoSimdUnop(IntAbs<u16>)));
+      case O::I32X4Abs:
+        RETURN_IF((DoSimdUnop(IntAbs<u32>)));
+      case O::I64X2Abs:
+        RETURN_IF((DoSimdUnop(IntAbs<u64>)));
+
+      case O::I8X16Popcnt:
+        RETURN_IF((DoSimdUnop(IntPopcnt<u8>)));
+
+      case O::I16X8ExtaddPairwiseI8X16S:
+        RETURN_IF((DoSimdExtaddPairwise<s16x8, s8x16>()));
+      case O::I16X8ExtaddPairwiseI8X16U:
+        RETURN_IF((DoSimdExtaddPairwise<u16x8, u8x16>()));
+      case O::I32X4ExtaddPairwiseI16X8S:
+        RETURN_IF((DoSimdExtaddPairwise<s32x4, s16x8>()));
+      case O::I32X4ExtaddPairwiseI16X8U:
+        RETURN_IF((DoSimdExtaddPairwise<u32x4, u16x8>()));
+
+      case O::I16X8ExtmulLowI8X16S:
+        RETURN_IF((DoSimdExtmul<s16x8, s8x16, true>()));
+      case O::I16X8ExtmulHighI8X16S:
+        RETURN_IF((DoSimdExtmul<s16x8, s8x16, false>()));
+      case O::I16X8ExtmulLowI8X16U:
+        RETURN_IF((DoSimdExtmul<u16x8, u8x16, true>()));
+      case O::I16X8ExtmulHighI8X16U:
+        RETURN_IF((DoSimdExtmul<u16x8, u8x16, false>()));
+      case O::I32X4ExtmulLowI16X8S:
+        RETURN_IF((DoSimdExtmul<s32x4, s16x8, true>()));
+      case O::I32X4ExtmulHighI16X8S:
+        RETURN_IF((DoSimdExtmul<s32x4, s16x8, false>()));
+      case O::I32X4ExtmulLowI16X8U:
+        RETURN_IF((DoSimdExtmul<u32x4, u16x8, true>()));
+      case O::I32X4ExtmulHighI16X8U:
+        RETURN_IF((DoSimdExtmul<u32x4, u16x8, false>()));
+      case O::I64X2ExtmulLowI32X4S:
+        RETURN_IF((DoSimdExtmul<s64x2, s32x4, true>()));
+      case O::I64X2ExtmulHighI32X4S:
+        RETURN_IF((DoSimdExtmul<s64x2, s32x4, false>()));
+      case O::I64X2ExtmulLowI32X4U:
+        RETURN_IF((DoSimdExtmul<u64x2, u32x4, true>()));
+      case O::I64X2ExtmulHighI32X4U:
+        RETURN_IF((DoSimdExtmul<u64x2, u32x4, false>()));
+
+      case O::I16X8Q15mulrSatS:
+        RETURN_IF((DoSimdBinop(SaturatingRoundingQMul<s16>)));
+
+      case O::I32X4DotI16X8S:
+        RETURN_IF((DoSimdDot<u32x4, s16x8>()));
+
+      case O::AtomicFence:
+      case O::MemoryAtomicNotify:
+      case O::MemoryAtomicWait32:
+      case O::MemoryAtomicWait64:
+        RETURN_IF((TRAP("not implemented")));
+
+      case O::I32AtomicLoad:
+        RETURN_IF((DoAtomicLoad<u32>(instr, out_trap)));
+      case O::I64AtomicLoad:
+        RETURN_IF((DoAtomicLoad<u64>(instr, out_trap)));
+      case O::I32AtomicLoad8U:
+        RETURN_IF((DoAtomicLoad<u32, u8>(instr, out_trap)));
+      case O::I32AtomicLoad16U:
+        RETURN_IF((DoAtomicLoad<u32, u16>(instr, out_trap)));
+      case O::I64AtomicLoad8U:
+        RETURN_IF((DoAtomicLoad<u64, u8>(instr, out_trap)));
+      case O::I64AtomicLoad16U:
+        RETURN_IF((DoAtomicLoad<u64, u16>(instr, out_trap)));
+      case O::I64AtomicLoad32U:
+        RETURN_IF((DoAtomicLoad<u64, u32>(instr, out_trap)));
+      case O::I32AtomicStore:
+        RETURN_IF((DoAtomicStore<u32>(instr, out_trap)));
+      case O::I64AtomicStore:
+        RETURN_IF((DoAtomicStore<u64>(instr, out_trap)));
+      case O::I32AtomicStore8:
+        RETURN_IF((DoAtomicStore<u32, u8>(instr, out_trap)));
+      case O::I32AtomicStore16:
+        RETURN_IF((DoAtomicStore<u32, u16>(instr, out_trap)));
+      case O::I64AtomicStore8:
+        RETURN_IF((DoAtomicStore<u64, u8>(instr, out_trap)));
+      case O::I64AtomicStore16:
+        RETURN_IF((DoAtomicStore<u64, u16>(instr, out_trap)));
+      case O::I64AtomicStore32:
+        RETURN_IF((DoAtomicStore<u64, u32>(instr, out_trap)));
+      case O::I32AtomicRmwAdd:
+        RETURN_IF((DoAtomicRmw<u32>(Add<u32>, instr, out_trap)));
+      case O::I64AtomicRmwAdd:
+        RETURN_IF((DoAtomicRmw<u64>(Add<u64>, instr, out_trap)));
+      case O::I32AtomicRmw8AddU:
+        RETURN_IF((DoAtomicRmw<u32>(Add<u8>, instr, out_trap)));
+      case O::I32AtomicRmw16AddU:
+        RETURN_IF((DoAtomicRmw<u32>(Add<u16>, instr, out_trap)));
+      case O::I64AtomicRmw8AddU:
+        RETURN_IF((DoAtomicRmw<u64>(Add<u8>, instr, out_trap)));
+      case O::I64AtomicRmw16AddU:
+        RETURN_IF((DoAtomicRmw<u64>(Add<u16>, instr, out_trap)));
+      case O::I64AtomicRmw32AddU:
+        RETURN_IF((DoAtomicRmw<u64>(Add<u32>, instr, out_trap)));
+      case O::I32AtomicRmwSub:
+        RETURN_IF((DoAtomicRmw<u32>(Sub<u32>, instr, out_trap)));
+      case O::I64AtomicRmwSub:
+        RETURN_IF((DoAtomicRmw<u64>(Sub<u64>, instr, out_trap)));
+      case O::I32AtomicRmw8SubU:
+        RETURN_IF((DoAtomicRmw<u32>(Sub<u8>, instr, out_trap)));
+      case O::I32AtomicRmw16SubU:
+        RETURN_IF((DoAtomicRmw<u32>(Sub<u16>, instr, out_trap)));
+      case O::I64AtomicRmw8SubU:
+        RETURN_IF((DoAtomicRmw<u64>(Sub<u8>, instr, out_trap)));
+      case O::I64AtomicRmw16SubU:
+        RETURN_IF((DoAtomicRmw<u64>(Sub<u16>, instr, out_trap)));
+      case O::I64AtomicRmw32SubU:
+        RETURN_IF((DoAtomicRmw<u64>(Sub<u32>, instr, out_trap)));
+      case O::I32AtomicRmwAnd:
+        RETURN_IF((DoAtomicRmw<u32>(IntAnd<u32>, instr, out_trap)));
+      case O::I64AtomicRmwAnd:
+        RETURN_IF((DoAtomicRmw<u64>(IntAnd<u64>, instr, out_trap)));
+      case O::I32AtomicRmw8AndU:
+        RETURN_IF((DoAtomicRmw<u32>(IntAnd<u8>, instr, out_trap)));
+      case O::I32AtomicRmw16AndU:
+        RETURN_IF((DoAtomicRmw<u32>(IntAnd<u16>, instr, out_trap)));
+      case O::I64AtomicRmw8AndU:
+        RETURN_IF((DoAtomicRmw<u64>(IntAnd<u8>, instr, out_trap)));
+      case O::I64AtomicRmw16AndU:
+        RETURN_IF((DoAtomicRmw<u64>(IntAnd<u16>, instr, out_trap)));
+      case O::I64AtomicRmw32AndU:
+        RETURN_IF((DoAtomicRmw<u64>(IntAnd<u32>, instr, out_trap)));
+      case O::I32AtomicRmwOr:
+        RETURN_IF((DoAtomicRmw<u32>(IntOr<u32>, instr, out_trap)));
+      case O::I64AtomicRmwOr:
+        RETURN_IF((DoAtomicRmw<u64>(IntOr<u64>, instr, out_trap)));
+      case O::I32AtomicRmw8OrU:
+        RETURN_IF((DoAtomicRmw<u32>(IntOr<u8>, instr, out_trap)));
+      case O::I32AtomicRmw16OrU:
+        RETURN_IF((DoAtomicRmw<u32>(IntOr<u16>, instr, out_trap)));
+      case O::I64AtomicRmw8OrU:
+        RETURN_IF((DoAtomicRmw<u64>(IntOr<u8>, instr, out_trap)));
+      case O::I64AtomicRmw16OrU:
+        RETURN_IF((DoAtomicRmw<u64>(IntOr<u16>, instr, out_trap)));
+      case O::I64AtomicRmw32OrU:
+        RETURN_IF((DoAtomicRmw<u64>(IntOr<u32>, instr, out_trap)));
+      case O::I32AtomicRmwXor:
+        RETURN_IF((DoAtomicRmw<u32>(IntXor<u32>, instr, out_trap)));
+      case O::I64AtomicRmwXor:
+        RETURN_IF((DoAtomicRmw<u64>(IntXor<u64>, instr, out_trap)));
+      case O::I32AtomicRmw8XorU:
+        RETURN_IF((DoAtomicRmw<u32>(IntXor<u8>, instr, out_trap)));
+      case O::I32AtomicRmw16XorU:
+        RETURN_IF((DoAtomicRmw<u32>(IntXor<u16>, instr, out_trap)));
+      case O::I64AtomicRmw8XorU:
+        RETURN_IF((DoAtomicRmw<u64>(IntXor<u8>, instr, out_trap)));
+      case O::I64AtomicRmw16XorU:
+        RETURN_IF((DoAtomicRmw<u64>(IntXor<u16>, instr, out_trap)));
+      case O::I64AtomicRmw32XorU:
+        RETURN_IF((DoAtomicRmw<u64>(IntXor<u32>, instr, out_trap)));
+      case O::I32AtomicRmwXchg:
+        RETURN_IF((DoAtomicRmw<u32>(Xchg<u32>, instr, out_trap)));
+      case O::I64AtomicRmwXchg:
+        RETURN_IF((DoAtomicRmw<u64>(Xchg<u64>, instr, out_trap)));
+      case O::I32AtomicRmw8XchgU:
+        RETURN_IF((DoAtomicRmw<u32>(Xchg<u8>, instr, out_trap)));
+      case O::I32AtomicRmw16XchgU:
+        RETURN_IF((DoAtomicRmw<u32>(Xchg<u16>, instr, out_trap)));
+      case O::I64AtomicRmw8XchgU:
+        RETURN_IF((DoAtomicRmw<u64>(Xchg<u8>, instr, out_trap)));
+      case O::I64AtomicRmw16XchgU:
+        RETURN_IF((DoAtomicRmw<u64>(Xchg<u16>, instr, out_trap)));
+      case O::I64AtomicRmw32XchgU:
+        RETURN_IF((DoAtomicRmw<u64>(Xchg<u32>, instr, out_trap)));
+
+      case O::I32AtomicRmwCmpxchg:
+        RETURN_IF((DoAtomicRmwCmpxchg<u32>(instr, out_trap)));
+      case O::I64AtomicRmwCmpxchg:
+        RETURN_IF((DoAtomicRmwCmpxchg<u64>(instr, out_trap)));
+      case O::I32AtomicRmw8CmpxchgU:
+        RETURN_IF((DoAtomicRmwCmpxchg<u32, u8>(instr, out_trap)));
+      case O::I32AtomicRmw16CmpxchgU:
+        RETURN_IF((DoAtomicRmwCmpxchg<u32, u16>(instr, out_trap)));
+      case O::I64AtomicRmw8CmpxchgU:
+        RETURN_IF((DoAtomicRmwCmpxchg<u64, u8>(instr, out_trap)));
+      case O::I64AtomicRmw16CmpxchgU:
+        RETURN_IF((DoAtomicRmwCmpxchg<u64, u16>(instr, out_trap)));
+      case O::I64AtomicRmw32CmpxchgU:
+        RETURN_IF((DoAtomicRmwCmpxchg<u64, u32>(instr, out_trap)));
+
+      case O::Throw: {
+        u32 tag_index = instr.imm_u32;
+        Values params;
+        Ref tag_ref = inst_->tags()[tag_index];
+        Tag::Ptr tag{store_, tag_ref};
+        PopValues(tag->type().signature, &params);
+        Exception::Ptr exn = Exception::New(store_, tag_ref, params);
+        RETURN_IF((DoThrow(exn)));
+      }
+      case O::Rethrow: {
+        u32 exn_index = instr.imm_u32;
+        Exception::Ptr exn{store_,
+                           exceptions_[exceptions_.size() - exn_index - 1]};
+        RETURN_IF((DoThrow(exn)));
+      }
+
+      // The following opcodes are either never generated or should never be
+      // executed.
+      case O::Nop:
+      case O::Block:
+      case O::Loop:
+      case O::If:
+      case O::Else:
+      case O::End:
+      case O::ReturnCall:
+      case O::SelectT:
+
+      case O::CallRef:
+      case O::Try:
+      case O::Catch:
+      case O::CatchAll:
+      case O::Delegate:
+      case O::InterpData:
+      case O::Invalid:
+        WABT_UNREACHABLE;
+        break;
     }
-
-    // This operation adjusts the function reference of the reused frame
-    // after a return_call. This ensures the correct exception handlers are
-    // used for the call.
-    case O::InterpAdjustFrameForReturnCall: {
-      Ref new_func_ref = inst_->funcs()[instr.imm_u32];
-      Frame& current_frame = frames_.back();
-      current_frame.func = new_func_ref;
-      break;
-    }
-
-    case O::I32TruncSatF32S: return DoUnop(IntTruncSat<s32, f32>);
-    case O::I32TruncSatF32U: return DoUnop(IntTruncSat<u32, f32>);
-    case O::I32TruncSatF64S: return DoUnop(IntTruncSat<s32, f64>);
-    case O::I32TruncSatF64U: return DoUnop(IntTruncSat<u32, f64>);
-    case O::I64TruncSatF32S: return DoUnop(IntTruncSat<s64, f32>);
-    case O::I64TruncSatF32U: return DoUnop(IntTruncSat<u64, f32>);
-    case O::I64TruncSatF64S: return DoUnop(IntTruncSat<s64, f64>);
-    case O::I64TruncSatF64U: return DoUnop(IntTruncSat<u64, f64>);
-
-    case O::MemoryInit: return DoMemoryInit(instr, out_trap);
-    case O::DataDrop:   return DoDataDrop(instr);
-    case O::MemoryCopy: return DoMemoryCopy(instr, out_trap);
-    case O::MemoryFill: return DoMemoryFill(instr, out_trap);
-
-    case O::TableInit: return DoTableInit(instr, out_trap);
-    case O::ElemDrop:  return DoElemDrop(instr);
-    case O::TableCopy: return DoTableCopy(instr, out_trap);
-    case O::TableGet:  return DoTableGet(instr, out_trap);
-    case O::TableSet:  return DoTableSet(instr, out_trap);
-    case O::TableGrow: return DoTableGrow(instr, out_trap);
-    case O::TableSize: return DoTableSize(instr);
-    case O::TableFill: return DoTableFill(instr, out_trap);
-
-    case O::RefNull:
-      Push(Ref::Null);
-      break;
-
-    case O::RefIsNull:
-      Push(Pop<Ref>() == Ref::Null);
-      break;
-
-    case O::RefFunc:
-      Push(inst_->funcs()[instr.imm_u32]);
-      break;
-
-    case O::V128Load: return DoLoad<v128>(instr, out_trap);
-    case O::V128Store: return DoStore<v128>(instr, out_trap);
-
-    case O::V128Const:
-      Push<v128>(instr.imm_v128);
-      break;
-
-    case O::I8X16Splat:        return DoSimdSplat<u8x16, u32>();
-    case O::I8X16ExtractLaneS: return DoSimdExtract<s8x16, s32>(instr);
-    case O::I8X16ExtractLaneU: return DoSimdExtract<u8x16, u32>(instr);
-    case O::I8X16ReplaceLane:  return DoSimdReplace<u8x16, u32>(instr);
-    case O::I16X8Splat:        return DoSimdSplat<u16x8, u32>();
-    case O::I16X8ExtractLaneS: return DoSimdExtract<s16x8, s32>(instr);
-    case O::I16X8ExtractLaneU: return DoSimdExtract<u16x8, u32>(instr);
-    case O::I16X8ReplaceLane:  return DoSimdReplace<u16x8, u32>(instr);
-    case O::I32X4Splat:        return DoSimdSplat<u32x4, u32>();
-    case O::I32X4ExtractLane:  return DoSimdExtract<s32x4, u32>(instr);
-    case O::I32X4ReplaceLane:  return DoSimdReplace<u32x4, u32>(instr);
-    case O::I64X2Splat:        return DoSimdSplat<u64x2, u64>();
-    case O::I64X2ExtractLane:  return DoSimdExtract<u64x2, u64>(instr);
-    case O::I64X2ReplaceLane:  return DoSimdReplace<u64x2, u64>(instr);
-    case O::F32X4Splat:        return DoSimdSplat<f32x4, f32>();
-    case O::F32X4ExtractLane:  return DoSimdExtract<f32x4, f32>(instr);
-    case O::F32X4ReplaceLane:  return DoSimdReplace<f32x4, f32>(instr);
-    case O::F64X2Splat:        return DoSimdSplat<f64x2, f64>();
-    case O::F64X2ExtractLane:  return DoSimdExtract<f64x2, f64>(instr);
-    case O::F64X2ReplaceLane:  return DoSimdReplace<f64x2, f64>(instr);
-
-    case O::I8X16Eq:  return DoSimdBinop(EqMask<u8>);
-    case O::I8X16Ne:  return DoSimdBinop(NeMask<u8>);
-    case O::I8X16LtS: return DoSimdBinop(LtMask<s8>);
-    case O::I8X16LtU: return DoSimdBinop(LtMask<u8>);
-    case O::I8X16GtS: return DoSimdBinop(GtMask<s8>);
-    case O::I8X16GtU: return DoSimdBinop(GtMask<u8>);
-    case O::I8X16LeS: return DoSimdBinop(LeMask<s8>);
-    case O::I8X16LeU: return DoSimdBinop(LeMask<u8>);
-    case O::I8X16GeS: return DoSimdBinop(GeMask<s8>);
-    case O::I8X16GeU: return DoSimdBinop(GeMask<u8>);
-    case O::I16X8Eq:  return DoSimdBinop(EqMask<u16>);
-    case O::I16X8Ne:  return DoSimdBinop(NeMask<u16>);
-    case O::I16X8LtS: return DoSimdBinop(LtMask<s16>);
-    case O::I16X8LtU: return DoSimdBinop(LtMask<u16>);
-    case O::I16X8GtS: return DoSimdBinop(GtMask<s16>);
-    case O::I16X8GtU: return DoSimdBinop(GtMask<u16>);
-    case O::I16X8LeS: return DoSimdBinop(LeMask<s16>);
-    case O::I16X8LeU: return DoSimdBinop(LeMask<u16>);
-    case O::I16X8GeS: return DoSimdBinop(GeMask<s16>);
-    case O::I16X8GeU: return DoSimdBinop(GeMask<u16>);
-    case O::I32X4Eq:  return DoSimdBinop(EqMask<u32>);
-    case O::I32X4Ne:  return DoSimdBinop(NeMask<u32>);
-    case O::I32X4LtS: return DoSimdBinop(LtMask<s32>);
-    case O::I32X4LtU: return DoSimdBinop(LtMask<u32>);
-    case O::I32X4GtS: return DoSimdBinop(GtMask<s32>);
-    case O::I32X4GtU: return DoSimdBinop(GtMask<u32>);
-    case O::I32X4LeS: return DoSimdBinop(LeMask<s32>);
-    case O::I32X4LeU: return DoSimdBinop(LeMask<u32>);
-    case O::I32X4GeS: return DoSimdBinop(GeMask<s32>);
-    case O::I32X4GeU: return DoSimdBinop(GeMask<u32>);
-    case O::I64X2Eq:  return DoSimdBinop(EqMask<u64>);
-    case O::I64X2Ne:  return DoSimdBinop(NeMask<u64>);
-    case O::I64X2LtS: return DoSimdBinop(LtMask<s64>);
-    case O::I64X2GtS: return DoSimdBinop(GtMask<s64>);
-    case O::I64X2LeS: return DoSimdBinop(LeMask<s64>);
-    case O::I64X2GeS: return DoSimdBinop(GeMask<s64>);
-    case O::F32X4Eq:  return DoSimdBinop(EqMask<f32>);
-    case O::F32X4Ne:  return DoSimdBinop(NeMask<f32>);
-    case O::F32X4Lt:  return DoSimdBinop(LtMask<f32>);
-    case O::F32X4Gt:  return DoSimdBinop(GtMask<f32>);
-    case O::F32X4Le:  return DoSimdBinop(LeMask<f32>);
-    case O::F32X4Ge:  return DoSimdBinop(GeMask<f32>);
-    case O::F64X2Eq:  return DoSimdBinop(EqMask<f64>);
-    case O::F64X2Ne:  return DoSimdBinop(NeMask<f64>);
-    case O::F64X2Lt:  return DoSimdBinop(LtMask<f64>);
-    case O::F64X2Gt:  return DoSimdBinop(GtMask<f64>);
-    case O::F64X2Le:  return DoSimdBinop(LeMask<f64>);
-    case O::F64X2Ge:  return DoSimdBinop(GeMask<f64>);
-
-    case O::V128Not:       return DoSimdUnop(IntNot<u64>);
-    case O::V128And:       return DoSimdBinop(IntAnd<u64>);
-    case O::V128Or:        return DoSimdBinop(IntOr<u64>);
-    case O::V128Xor:       return DoSimdBinop(IntXor<u64>);
-    case O::V128BitSelect: return DoSimdBitSelect();
-    case O::V128AnyTrue:      return DoSimdIsTrue<u8x16, 1>();
-
-    case O::I8X16Neg:          return DoSimdUnop(IntNeg<u8>);
-    case O::I8X16Bitmask:      return DoSimdBitmask<s8x16>();
-    case O::I8X16AllTrue:      return DoSimdIsTrue<u8x16, 16>();
-    case O::I8X16Shl:          return DoSimdShift(IntShl<u8>);
-    case O::I8X16ShrS:         return DoSimdShift(IntShr<s8>);
-    case O::I8X16ShrU:         return DoSimdShift(IntShr<u8>);
-    case O::I8X16Add:          return DoSimdBinop(Add<u8>);
-    case O::I8X16AddSatS:      return DoSimdBinop(IntAddSat<s8>);
-    case O::I8X16AddSatU:      return DoSimdBinop(IntAddSat<u8>);
-    case O::I8X16Sub:          return DoSimdBinop(Sub<u8>);
-    case O::I8X16SubSatS:      return DoSimdBinop(IntSubSat<s8>);
-    case O::I8X16SubSatU:      return DoSimdBinop(IntSubSat<u8>);
-    case O::I8X16MinS:         return DoSimdBinop(IntMin<s8>);
-    case O::I8X16MinU:         return DoSimdBinop(IntMin<u8>);
-    case O::I8X16MaxS:         return DoSimdBinop(IntMax<s8>);
-    case O::I8X16MaxU:         return DoSimdBinop(IntMax<u8>);
-
-    case O::I16X8Neg:          return DoSimdUnop(IntNeg<u16>);
-    case O::I16X8Bitmask:      return DoSimdBitmask<s16x8>();
-    case O::I16X8AllTrue:      return DoSimdIsTrue<u16x8, 8>();
-    case O::I16X8Shl:          return DoSimdShift(IntShl<u16>);
-    case O::I16X8ShrS:         return DoSimdShift(IntShr<s16>);
-    case O::I16X8ShrU:         return DoSimdShift(IntShr<u16>);
-    case O::I16X8Add:          return DoSimdBinop(Add<u16>);
-    case O::I16X8AddSatS:      return DoSimdBinop(IntAddSat<s16>);
-    case O::I16X8AddSatU:      return DoSimdBinop(IntAddSat<u16>);
-    case O::I16X8Sub:          return DoSimdBinop(Sub<u16>);
-    case O::I16X8SubSatS:      return DoSimdBinop(IntSubSat<s16>);
-    case O::I16X8SubSatU:      return DoSimdBinop(IntSubSat<u16>);
-    case O::I16X8Mul:          return DoSimdBinop(Mul<u16>);
-    case O::I16X8MinS:         return DoSimdBinop(IntMin<s16>);
-    case O::I16X8MinU:         return DoSimdBinop(IntMin<u16>);
-    case O::I16X8MaxS:         return DoSimdBinop(IntMax<s16>);
-    case O::I16X8MaxU:         return DoSimdBinop(IntMax<u16>);
-
-    case O::I32X4Neg:          return DoSimdUnop(IntNeg<u32>);
-    case O::I32X4Bitmask:      return DoSimdBitmask<s32x4>();
-    case O::I32X4AllTrue:      return DoSimdIsTrue<u32x4, 4>();
-    case O::I32X4Shl:          return DoSimdShift(IntShl<u32>);
-    case O::I32X4ShrS:         return DoSimdShift(IntShr<s32>);
-    case O::I32X4ShrU:         return DoSimdShift(IntShr<u32>);
-    case O::I32X4Add:          return DoSimdBinop(Add<u32>);
-    case O::I32X4Sub:          return DoSimdBinop(Sub<u32>);
-    case O::I32X4Mul:          return DoSimdBinop(Mul<u32>);
-    case O::I32X4MinS:         return DoSimdBinop(IntMin<s32>);
-    case O::I32X4MinU:         return DoSimdBinop(IntMin<u32>);
-    case O::I32X4MaxS:         return DoSimdBinop(IntMax<s32>);
-    case O::I32X4MaxU:         return DoSimdBinop(IntMax<u32>);
-
-    case O::I64X2Neg:          return DoSimdUnop(IntNeg<u64>);
-    case O::I64X2Bitmask:      return DoSimdBitmask<s64x2>();
-    case O::I64X2AllTrue:      return DoSimdIsTrue<u64x2, 2>();
-    case O::I64X2Shl:          return DoSimdShift(IntShl<u64>);
-    case O::I64X2ShrS:         return DoSimdShift(IntShr<s64>);
-    case O::I64X2ShrU:         return DoSimdShift(IntShr<u64>);
-    case O::I64X2Add:          return DoSimdBinop(Add<u64>);
-    case O::I64X2Sub:          return DoSimdBinop(Sub<u64>);
-    case O::I64X2Mul:          return DoSimdBinop(Mul<u64>);
-
-    case O::F32X4Ceil:         return DoSimdUnop(FloatCeil<f32>);
-    case O::F32X4Floor:        return DoSimdUnop(FloatFloor<f32>);
-    case O::F32X4Trunc:        return DoSimdUnop(FloatTrunc<f32>);
-    case O::F32X4Nearest:      return DoSimdUnop(FloatNearest<f32>);
-
-    case O::F64X2Ceil:         return DoSimdUnop(FloatCeil<f64>);
-    case O::F64X2Floor:        return DoSimdUnop(FloatFloor<f64>);
-    case O::F64X2Trunc:        return DoSimdUnop(FloatTrunc<f64>);
-    case O::F64X2Nearest:      return DoSimdUnop(FloatNearest<f64>);
-
-    case O::F32X4Abs:          return DoSimdUnop(FloatAbs<f32>);
-    case O::F32X4Neg:          return DoSimdUnop(FloatNeg<f32>);
-    case O::F32X4Sqrt:         return DoSimdUnop(FloatSqrt<f32>);
-    case O::F32X4Add:          return DoSimdBinop(Add<f32>);
-    case O::F32X4Sub:          return DoSimdBinop(Sub<f32>);
-    case O::F32X4Mul:          return DoSimdBinop(Mul<f32>);
-    case O::F32X4Div:          return DoSimdBinop(FloatDiv<f32>);
-    case O::F32X4Min:          return DoSimdBinop(FloatMin<f32>);
-    case O::F32X4Max:          return DoSimdBinop(FloatMax<f32>);
-    case O::F32X4PMin:         return DoSimdBinop(FloatPMin<f32>);
-    case O::F32X4PMax:         return DoSimdBinop(FloatPMax<f32>);
-
-    case O::F64X2Abs:          return DoSimdUnop(FloatAbs<f64>);
-    case O::F64X2Neg:          return DoSimdUnop(FloatNeg<f64>);
-    case O::F64X2Sqrt:         return DoSimdUnop(FloatSqrt<f64>);
-    case O::F64X2Add:          return DoSimdBinop(Add<f64>);
-    case O::F64X2Sub:          return DoSimdBinop(Sub<f64>);
-    case O::F64X2Mul:          return DoSimdBinop(Mul<f64>);
-    case O::F64X2Div:          return DoSimdBinop(FloatDiv<f64>);
-    case O::F64X2Min:          return DoSimdBinop(FloatMin<f64>);
-    case O::F64X2Max:          return DoSimdBinop(FloatMax<f64>);
-    case O::F64X2PMin:         return DoSimdBinop(FloatPMin<f64>);
-    case O::F64X2PMax:         return DoSimdBinop(FloatPMax<f64>);
-
-    case O::I32X4TruncSatF32X4S: return DoSimdUnop(IntTruncSat<s32, f32>);
-    case O::I32X4TruncSatF32X4U: return DoSimdUnop(IntTruncSat<u32, f32>);
-    case O::F32X4ConvertI32X4S:  return DoSimdUnop(Convert<f32, s32>);
-    case O::F32X4ConvertI32X4U:  return DoSimdUnop(Convert<f32, u32>);
-    case O::F32X4DemoteF64X2Zero: return DoSimdUnopZero(Convert<f32, f64>);
-    case O::F64X2PromoteLowF32X4: return DoSimdConvert<f64x2, f32x4, true>();
-    case O::I32X4TruncSatF64X2SZero: return DoSimdUnopZero(IntTruncSat<s32, f64>);
-    case O::I32X4TruncSatF64X2UZero: return DoSimdUnopZero(IntTruncSat<u32, f64>);
-    case O::F64X2ConvertLowI32X4S: return DoSimdConvert<f64x2, s32x4, true>();
-    case O::F64X2ConvertLowI32X4U: return DoSimdConvert<f64x2, u32x4, true>();
-
-    case O::I8X16Swizzle:     return DoSimdSwizzle();
-    case O::I8X16Shuffle:     return DoSimdShuffle(instr);
-
-    case O::V128Load8Splat:    return DoSimdLoadSplat<u8x16>(instr, out_trap);
-    case O::V128Load16Splat:   return DoSimdLoadSplat<u16x8>(instr, out_trap);
-    case O::V128Load32Splat:   return DoSimdLoadSplat<u32x4>(instr, out_trap);
-    case O::V128Load64Splat:   return DoSimdLoadSplat<u64x2>(instr, out_trap);
-
-    case O::V128Load8Lane:    return DoSimdLoadLane<u8x16>(instr, out_trap);
-    case O::V128Load16Lane:   return DoSimdLoadLane<u16x8>(instr, out_trap);
-    case O::V128Load32Lane:   return DoSimdLoadLane<u32x4>(instr, out_trap);
-    case O::V128Load64Lane:   return DoSimdLoadLane<u64x2>(instr, out_trap);
-
-    case O::V128Store8Lane:    return DoSimdStoreLane<u8x16>(instr, out_trap);
-    case O::V128Store16Lane:   return DoSimdStoreLane<u16x8>(instr, out_trap);
-    case O::V128Store32Lane:   return DoSimdStoreLane<u32x4>(instr, out_trap);
-    case O::V128Store64Lane:   return DoSimdStoreLane<u64x2>(instr, out_trap);
-
-    case O::V128Load32Zero: return DoSimdLoadZero<u32x4, u32>(instr, out_trap);
-    case O::V128Load64Zero: return DoSimdLoadZero<u64x2, u64>(instr, out_trap);
-
-    case O::I8X16NarrowI16X8S:    return DoSimdNarrow<s8x16, s16x8>();
-    case O::I8X16NarrowI16X8U:    return DoSimdNarrow<u8x16, s16x8>();
-    case O::I16X8NarrowI32X4S:    return DoSimdNarrow<s16x8, s32x4>();
-    case O::I16X8NarrowI32X4U:    return DoSimdNarrow<u16x8, s32x4>();
-    case O::I16X8ExtendLowI8X16S:  return DoSimdConvert<s16x8, s8x16, true>();
-    case O::I16X8ExtendHighI8X16S: return DoSimdConvert<s16x8, s8x16, false>();
-    case O::I16X8ExtendLowI8X16U:  return DoSimdConvert<u16x8, u8x16, true>();
-    case O::I16X8ExtendHighI8X16U: return DoSimdConvert<u16x8, u8x16, false>();
-    case O::I32X4ExtendLowI16X8S:  return DoSimdConvert<s32x4, s16x8, true>();
-    case O::I32X4ExtendHighI16X8S: return DoSimdConvert<s32x4, s16x8, false>();
-    case O::I32X4ExtendLowI16X8U:  return DoSimdConvert<u32x4, u16x8, true>();
-    case O::I32X4ExtendHighI16X8U: return DoSimdConvert<u32x4, u16x8, false>();
-    case O::I64X2ExtendLowI32X4S:  return DoSimdConvert<s64x2, s32x4, true>();
-    case O::I64X2ExtendHighI32X4S: return DoSimdConvert<s64x2, s32x4, false>();
-    case O::I64X2ExtendLowI32X4U:  return DoSimdConvert<u64x2, u32x4, true>();
-    case O::I64X2ExtendHighI32X4U: return DoSimdConvert<u64x2, u32x4, false>();
-
-    case O::V128Load8X8S:  return DoSimdLoadExtend<s16x8, s8x8>(instr, out_trap);
-    case O::V128Load8X8U:  return DoSimdLoadExtend<u16x8, u8x8>(instr, out_trap);
-    case O::V128Load16X4S: return DoSimdLoadExtend<s32x4, s16x4>(instr, out_trap);
-    case O::V128Load16X4U: return DoSimdLoadExtend<u32x4, u16x4>(instr, out_trap);
-    case O::V128Load32X2S: return DoSimdLoadExtend<s64x2, s32x2>(instr, out_trap);
-    case O::V128Load32X2U: return DoSimdLoadExtend<u64x2, u32x2>(instr, out_trap);
-
-    case O::V128Andnot: return DoSimdBinop(IntAndNot<u64>);
-    case O::I8X16AvgrU: return DoSimdBinop(IntAvgr<u8>);
-    case O::I16X8AvgrU: return DoSimdBinop(IntAvgr<u16>);
-
-    case O::I8X16Abs: return DoSimdUnop(IntAbs<u8>);
-    case O::I16X8Abs: return DoSimdUnop(IntAbs<u16>);
-    case O::I32X4Abs: return DoSimdUnop(IntAbs<u32>);
-    case O::I64X2Abs: return DoSimdUnop(IntAbs<u64>);
-
-    case O::I8X16Popcnt: return DoSimdUnop(IntPopcnt<u8>);
-
-    case O::I16X8ExtaddPairwiseI8X16S: return DoSimdExtaddPairwise<s16x8, s8x16>();
-    case O::I16X8ExtaddPairwiseI8X16U: return DoSimdExtaddPairwise<u16x8, u8x16>();
-    case O::I32X4ExtaddPairwiseI16X8S: return DoSimdExtaddPairwise<s32x4, s16x8>();
-    case O::I32X4ExtaddPairwiseI16X8U: return DoSimdExtaddPairwise<u32x4, u16x8>();
-
-    case O::I16X8ExtmulLowI8X16S: return DoSimdExtmul<s16x8, s8x16, true>();
-    case O::I16X8ExtmulHighI8X16S: return DoSimdExtmul<s16x8, s8x16, false>();
-    case O::I16X8ExtmulLowI8X16U: return DoSimdExtmul<u16x8, u8x16, true>();
-    case O::I16X8ExtmulHighI8X16U: return DoSimdExtmul<u16x8, u8x16, false>();
-    case O::I32X4ExtmulLowI16X8S: return DoSimdExtmul<s32x4, s16x8, true>();
-    case O::I32X4ExtmulHighI16X8S: return DoSimdExtmul<s32x4, s16x8, false>();
-    case O::I32X4ExtmulLowI16X8U: return DoSimdExtmul<u32x4, u16x8, true>();
-    case O::I32X4ExtmulHighI16X8U: return DoSimdExtmul<u32x4, u16x8, false>();
-    case O::I64X2ExtmulLowI32X4S: return DoSimdExtmul<s64x2, s32x4, true>();
-    case O::I64X2ExtmulHighI32X4S: return DoSimdExtmul<s64x2, s32x4, false>();
-    case O::I64X2ExtmulLowI32X4U: return DoSimdExtmul<u64x2, u32x4, true>();
-    case O::I64X2ExtmulHighI32X4U: return DoSimdExtmul<u64x2, u32x4, false>();
-
-    case O::I16X8Q15mulrSatS: return DoSimdBinop(SaturatingRoundingQMul<s16>);
-
-    case O::I32X4DotI16X8S: return DoSimdDot<u32x4, s16x8>();
-
-    case O::AtomicFence:
-    case O::MemoryAtomicNotify:
-    case O::MemoryAtomicWait32:
-    case O::MemoryAtomicWait64:
-      return TRAP("not implemented");
-
-    case O::I32AtomicLoad:       return DoAtomicLoad<u32>(instr, out_trap);
-    case O::I64AtomicLoad:       return DoAtomicLoad<u64>(instr, out_trap);
-    case O::I32AtomicLoad8U:     return DoAtomicLoad<u32, u8>(instr, out_trap);
-    case O::I32AtomicLoad16U:    return DoAtomicLoad<u32, u16>(instr, out_trap);
-    case O::I64AtomicLoad8U:     return DoAtomicLoad<u64, u8>(instr, out_trap);
-    case O::I64AtomicLoad16U:    return DoAtomicLoad<u64, u16>(instr, out_trap);
-    case O::I64AtomicLoad32U:    return DoAtomicLoad<u64, u32>(instr, out_trap);
-    case O::I32AtomicStore:      return DoAtomicStore<u32>(instr, out_trap);
-    case O::I64AtomicStore:      return DoAtomicStore<u64>(instr, out_trap);
-    case O::I32AtomicStore8:     return DoAtomicStore<u32, u8>(instr, out_trap);
-    case O::I32AtomicStore16:    return DoAtomicStore<u32, u16>(instr, out_trap);
-    case O::I64AtomicStore8:     return DoAtomicStore<u64, u8>(instr, out_trap);
-    case O::I64AtomicStore16:    return DoAtomicStore<u64, u16>(instr, out_trap);
-    case O::I64AtomicStore32:    return DoAtomicStore<u64, u32>(instr, out_trap);
-    case O::I32AtomicRmwAdd:     return DoAtomicRmw<u32>(Add<u32>, instr, out_trap);
-    case O::I64AtomicRmwAdd:     return DoAtomicRmw<u64>(Add<u64>, instr, out_trap);
-    case O::I32AtomicRmw8AddU:   return DoAtomicRmw<u32>(Add<u8>, instr, out_trap);
-    case O::I32AtomicRmw16AddU:  return DoAtomicRmw<u32>(Add<u16>, instr, out_trap);
-    case O::I64AtomicRmw8AddU:   return DoAtomicRmw<u64>(Add<u8>, instr, out_trap);
-    case O::I64AtomicRmw16AddU:  return DoAtomicRmw<u64>(Add<u16>, instr, out_trap);
-    case O::I64AtomicRmw32AddU:  return DoAtomicRmw<u64>(Add<u32>, instr, out_trap);
-    case O::I32AtomicRmwSub:     return DoAtomicRmw<u32>(Sub<u32>, instr, out_trap);
-    case O::I64AtomicRmwSub:     return DoAtomicRmw<u64>(Sub<u64>, instr, out_trap);
-    case O::I32AtomicRmw8SubU:   return DoAtomicRmw<u32>(Sub<u8>, instr, out_trap);
-    case O::I32AtomicRmw16SubU:  return DoAtomicRmw<u32>(Sub<u16>, instr, out_trap);
-    case O::I64AtomicRmw8SubU:   return DoAtomicRmw<u64>(Sub<u8>, instr, out_trap);
-    case O::I64AtomicRmw16SubU:  return DoAtomicRmw<u64>(Sub<u16>, instr, out_trap);
-    case O::I64AtomicRmw32SubU:  return DoAtomicRmw<u64>(Sub<u32>, instr, out_trap);
-    case O::I32AtomicRmwAnd:     return DoAtomicRmw<u32>(IntAnd<u32>, instr, out_trap);
-    case O::I64AtomicRmwAnd:     return DoAtomicRmw<u64>(IntAnd<u64>, instr, out_trap);
-    case O::I32AtomicRmw8AndU:   return DoAtomicRmw<u32>(IntAnd<u8>, instr, out_trap);
-    case O::I32AtomicRmw16AndU:  return DoAtomicRmw<u32>(IntAnd<u16>, instr, out_trap);
-    case O::I64AtomicRmw8AndU:   return DoAtomicRmw<u64>(IntAnd<u8>, instr, out_trap);
-    case O::I64AtomicRmw16AndU:  return DoAtomicRmw<u64>(IntAnd<u16>, instr, out_trap);
-    case O::I64AtomicRmw32AndU:  return DoAtomicRmw<u64>(IntAnd<u32>, instr, out_trap);
-    case O::I32AtomicRmwOr:      return DoAtomicRmw<u32>(IntOr<u32>, instr, out_trap);
-    case O::I64AtomicRmwOr:      return DoAtomicRmw<u64>(IntOr<u64>, instr, out_trap);
-    case O::I32AtomicRmw8OrU:    return DoAtomicRmw<u32>(IntOr<u8>, instr, out_trap);
-    case O::I32AtomicRmw16OrU:   return DoAtomicRmw<u32>(IntOr<u16>, instr, out_trap);
-    case O::I64AtomicRmw8OrU:    return DoAtomicRmw<u64>(IntOr<u8>, instr, out_trap);
-    case O::I64AtomicRmw16OrU:   return DoAtomicRmw<u64>(IntOr<u16>, instr, out_trap);
-    case O::I64AtomicRmw32OrU:   return DoAtomicRmw<u64>(IntOr<u32>, instr, out_trap);
-    case O::I32AtomicRmwXor:     return DoAtomicRmw<u32>(IntXor<u32>, instr, out_trap);
-    case O::I64AtomicRmwXor:     return DoAtomicRmw<u64>(IntXor<u64>, instr, out_trap);
-    case O::I32AtomicRmw8XorU:   return DoAtomicRmw<u32>(IntXor<u8>, instr, out_trap);
-    case O::I32AtomicRmw16XorU:  return DoAtomicRmw<u32>(IntXor<u16>, instr, out_trap);
-    case O::I64AtomicRmw8XorU:   return DoAtomicRmw<u64>(IntXor<u8>, instr, out_trap);
-    case O::I64AtomicRmw16XorU:  return DoAtomicRmw<u64>(IntXor<u16>, instr, out_trap);
-    case O::I64AtomicRmw32XorU:  return DoAtomicRmw<u64>(IntXor<u32>, instr, out_trap);
-    case O::I32AtomicRmwXchg:    return DoAtomicRmw<u32>(Xchg<u32>, instr, out_trap);
-    case O::I64AtomicRmwXchg:    return DoAtomicRmw<u64>(Xchg<u64>, instr, out_trap);
-    case O::I32AtomicRmw8XchgU:  return DoAtomicRmw<u32>(Xchg<u8>, instr, out_trap);
-    case O::I32AtomicRmw16XchgU: return DoAtomicRmw<u32>(Xchg<u16>, instr, out_trap);
-    case O::I64AtomicRmw8XchgU:  return DoAtomicRmw<u64>(Xchg<u8>, instr, out_trap);
-    case O::I64AtomicRmw16XchgU: return DoAtomicRmw<u64>(Xchg<u16>, instr, out_trap);
-    case O::I64AtomicRmw32XchgU: return DoAtomicRmw<u64>(Xchg<u32>, instr, out_trap);
-
-    case O::I32AtomicRmwCmpxchg:    return DoAtomicRmwCmpxchg<u32>(instr, out_trap);
-    case O::I64AtomicRmwCmpxchg:    return DoAtomicRmwCmpxchg<u64>(instr, out_trap);
-    case O::I32AtomicRmw8CmpxchgU:  return DoAtomicRmwCmpxchg<u32, u8>(instr, out_trap);
-    case O::I32AtomicRmw16CmpxchgU: return DoAtomicRmwCmpxchg<u32, u16>(instr, out_trap);
-    case O::I64AtomicRmw8CmpxchgU:  return DoAtomicRmwCmpxchg<u64, u8>(instr, out_trap);
-    case O::I64AtomicRmw16CmpxchgU: return DoAtomicRmwCmpxchg<u64, u16>(instr, out_trap);
-    case O::I64AtomicRmw32CmpxchgU: return DoAtomicRmwCmpxchg<u64, u32>(instr, out_trap);
-
-    case O::Throw: {
-      u32 tag_index = instr.imm_u32;
-      Values params;
-      Ref tag_ref = inst_->tags()[tag_index];
-      Tag::Ptr tag{store_, tag_ref};
-      PopValues(tag->type().signature, &params);
-      Exception::Ptr exn = Exception::New(store_, tag_ref, params);
-      return DoThrow(exn);
-    }
-    case O::Rethrow: {
-      u32 exn_index = instr.imm_u32;
-      Exception::Ptr exn{store_,
-                         exceptions_[exceptions_.size() - exn_index - 1]};
-      return DoThrow(exn);
-    }
-
-    // The following opcodes are either never generated or should never be
-    // executed.
-    case O::Nop:
-    case O::Block:
-    case O::Loop:
-    case O::If:
-    case O::Else:
-    case O::End:
-    case O::ReturnCall:
-    case O::SelectT:
-
-    case O::CallRef:
-    case O::Try:
-    case O::Catch:
-    case O::CatchAll:
-    case O::Delegate:
-    case O::InterpData:
-    case O::Invalid:
-      WABT_UNREACHABLE;
-      break;
   }
-
   return RunResult::Ok;
 }
 

@@ -21,6 +21,29 @@
 namespace wabt {
 
 // static
+#if COMPILER_IS_GNU
+void* Opcode::addressTable_[Opcode::Invalid];
+
+Opcode::Info Opcode::infos_[] = {
+#define WABT_OPCODE(rtype, type1, type2, type3, mem_size, prefix, code, Name, \
+                    text, decomp)                                             \
+  {text,     decomp, Type::rtype, {Type::type1, Type::type2, Type::type3},    \
+   mem_size, prefix, code,        PrefixCode(prefix, code),                   \
+   nullptr},
+#include "src/opcode.def"
+#undef WABT_OPCODE
+
+    {"<invalid>",
+     "",
+     Type::Void,
+     {Type::Void, Type::Void, Type::Void},
+     0,
+     0,
+     0,
+     0,
+     nullptr},
+};
+#else
 Opcode::Info Opcode::infos_[] = {
 #define WABT_OPCODE(rtype, type1, type2, type3, mem_size, prefix, code, Name, \
                     text, decomp)                                             \
@@ -31,6 +54,7 @@ Opcode::Info Opcode::infos_[] = {
 
   {"<invalid>", "", Type::Void, {Type::Void, Type::Void, Type::Void}, 0, 0, 0, 0},
 };
+#endif
 
 #define WABT_OPCODE(rtype, type1, type2, type3, mem_size, prefix, code, Name, \
                     text, decomp)                                             \

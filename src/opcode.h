@@ -68,6 +68,9 @@ struct Opcode {
   Type GetParamType3() const { return GetInfo().param_types[2]; }
   Type GetParamType(int n) const { return GetInfo().param_types[n - 1]; }
   Address GetMemorySize() const { return GetInfo().memory_size; }
+#if COMPILER_IS_GNU
+  void* GetCodeAddress() const { return GetInfo().code_addr; }
+#endif
 
   // If this is a load/store op, the type depends on the memory used.
   Type GetMemoryParam(Type param,
@@ -112,6 +115,9 @@ struct Opcode {
     uint8_t prefix;
     uint32_t code;
     uint32_t prefix_code;  // See PrefixCode below. Used for fast lookup.
+#if COMPILER_IS_GNU
+    void* code_addr;
+#endif
   };
 
   static uint32_t PrefixCode(uint8_t prefix, uint32_t code) {
@@ -151,6 +157,9 @@ struct Opcode {
 
   Info GetInfo() const;
   static Info infos_[];
+#if COMPILER_IS_GNU
+  static void* addressTable_[Opcode::Invalid];
+#endif
 
   Enum enum_;
 };

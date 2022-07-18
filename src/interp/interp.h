@@ -1099,7 +1099,6 @@ class Thread {
 
   RunResult Run(Trap::Ptr* out_trap);
   RunResult Run(int num_instructions, Trap::Ptr* out_trap);
-  RunResult Step(Trap::Ptr* out_trap);
 
   Store& store();
   void Mark();
